@@ -1,0 +1,37 @@
+<html>
+  <head>
+    <title>Top 100 According to NPR</title>
+  </head>
+  <body>
+    <h1>Top 100 Science Fiction and Fantasy Books According to NPR</h1>
+    <p>Sample application to demonstrate
+      <a href="http://code.google.com/apis/bigquery/">Google's BigQuery</a>
+      and the new
+      <a href="http://code.google.com/apis/bigquery/docs/query-reference.html#joins">
+        JOIN</a> capability in SQL-like queries.
+    </p>
+    <p>The selection of books and ranking come from
+      <a href="http://www.npr.org/2011/08/11/139085843/your-picks-top-100-science-fiction-fantasy-books">npr books</a> and the genres come from
+      <a href="http://www.freebase.com/view/book">Freebase books</a>, associated
+      using <a href="http://code.google.com/p/google-refine/">Google Refine</a>
+      and its link to Freebase.
+    </p>
+    <p>There is an explicit AND between the fields. Rank may be entered as an integer or range (e.g. &lt;10)</p>
+    <p>You can see the full list by just clicking on "Search"</p>
+    <form action="/about" method="post">
+      <table>
+        <tr><th>Rank</th><th>Title</th><th>Author</th><th>Genre</th></tr>
+        <tr>
+          <td><input type="text" name="rank"></td>
+          <td><input type="text" name="title"></td>
+          <td><input type="text" name="author"></td>
+          <td><input type="text" name="genre"></td>
+          <!--<td><input type="checkbox" name="ignorecase">IGNORE CASE</td>-->
+        </tr>
+      </table>
+      <input type="submit" value="Search">
+    </form>
+    <hr>
+    <p>{{ text }}</p>
+  </body>
+</html>
