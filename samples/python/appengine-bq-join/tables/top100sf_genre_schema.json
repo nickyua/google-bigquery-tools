@@ -1,8 +1,8 @@
 [
-  { 'name': 'id',
-    'type': 'integer'
+  { "name": "id",
+    "type": "integer"
   },
-  { 'name': 'genre_list',
-    'type': 'string'
+  { "name": "genre_list",
+    "type": "string"
   }
 ]
