@@ -1,5 +1,5 @@
-application: rufus-bq-002
-version: 2
+application: appengine-bq-join
+version: 1
 runtime: python
 api_version: 1
 
