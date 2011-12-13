@@ -4,8 +4,8 @@
 """Table formatting library.
 
 We define a TableFormatter interface, and create subclasses for
-several different print formats, including formats intended for
-both human and machine consumption:
+several different print formats, including formats intended for both
+human and machine consumption:
 
 Human Consumption
 -----------------
@@ -120,6 +120,11 @@ class TableFormatter(object):
     # TODO(user): Excise this bigquery-specific method.
     align = 'l' if field.get('type', []) == 'STRING' else 'r'
     self.AddColumn(field['name'], align=align)
+
+  def AddFields(self, fields):
+    """Convenience method to add a list of fields."""
+    for field in fields:
+      self.AddField(field)
 
   def AddDict(self, d):
     """Add a dict as a row by using column names as keys."""

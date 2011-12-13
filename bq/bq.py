@@ -254,6 +254,14 @@ def _GetFormatterFromFlags(secondary_format='sparse'):
     return table_formatter.GetFormatter(secondary_format)
 
 
+def _PrintTable(client, table_dict, **extra_args):
+  fields, rows = client.ReadSchemaAndRows(table_dict, **extra_args)
+  formatter = _GetFormatterFromFlags(secondary_format='pretty')
+  formatter.AddFields(fields)
+  formatter.AddRows(rows)
+  formatter.Print()
+
+
 class Client(object):
   client = None
 
@@ -483,13 +491,13 @@ class BigqueryCmd(NewCmd):
     print flags.TextWrap('\n'.join(response))
     return retcode
 
-  def ExecuteJob(self, configuration):
+  def ExecuteJob(self, configuration, upload_file=None):
     """Execute a job, possibly waiting for results."""
     client = Client.Get()
     if FLAGS.sync:
-      job = client.RunJobSynchronously(configuration)
+      job = client.RunJobSynchronously(configuration, upload_file=upload_file)
     else:
-      job = client.StartJob(configuration)
+      job = client.StartJob(configuration, upload_file=upload_file)
       client.RaiseIfJobError(job)
       reference = BigqueryClient.ConstructObjectReference(job)
       print 'Successfully started %s %s' % (self._command_name, reference)
@@ -497,7 +505,7 @@ class BigqueryCmd(NewCmd):
 
 
 class _Load(BigqueryCmd):
-  usage = """load <destination_table> <source_uri> <schema>"""
+  usage = """load <destination_table> <source> <schema>"""
 
   def __init__(self, name, fv):
     super(_Load, self).__init__(name, fv)
@@ -506,6 +514,13 @@ class _Load(BigqueryCmd):
         'The character that indicates the boundary between columns in the '
         'input file.',
         short_name='F', flag_values=fv)
+    flags.DEFINE_enum(
+        'encoding', None,
+        ['UTF-8', 'ISO-8859-1'],
+        'The character encoding used by the input file.  Options include:'
+        '\n ISO-8859-1 (also known as Latin-1)'
+        '\n UTF-8',
+        short_name='E', flag_values=fv)
     flags.DEFINE_integer(
         'skip_leading_rows', None,
         'The number of rows at the beginning of the source file to skip.',
@@ -520,14 +535,17 @@ class _Load(BigqueryCmd):
         'If true erase existing contents before loading new data.',
         flag_values=fv)
 
-  def RunWithArgs(self, destination_table, source_uris, schema=None):
-    """Perform a load operation of source_uri into destination_table.
+  def RunWithArgs(self, destination_table, source, schema=None):
+    """Perform a load operation of source into destination_table.
 
     Usage:
-      load <destination_table> <source_uris> [<schema>]
+      load <destination_table> <source> [<schema>]
 
-    Here <schema> should be either the name of a JSON file or a text schema.
-    This schema should be left out if the table already has one.
+    The <source> argument can be a path to a single local file, or a
+    comma-separated list of URIs.
+
+    The <schema> argument should be either the name of a JSON file or a text
+    schema. This schema should be omitted if the table already has one.
 
     In the case that the schema is provided in text form, it should be a
     comma-separated list of entries of the form name[:type], where type will
@@ -544,21 +562,34 @@ class _Load(BigqueryCmd):
     text schema.
 
     Examples:
+      bq load ds.new_tbl ./info.csv ./info_schema.json
       bq load ds.new_tbl gs://mybucket/info.csv ./info_schema.json
       bq load ds.small gs://mybucket/small.csv name:integer,value:string
       bq load ds.small gs://mybucket/small.csv field1,field2,field3
 
     Arguments:
       destination_table: Destination table name.
-      source_uris: Comma separated list of uri paths to data to import.
+      source: Name of local file to import, or a comma-separated list of
+        URI paths to data to import.
       schema: Either a text schema or JSON file, as above.
     """
     table_reference = Client.Get().GetTableReference(destination_table)
     load_request = {'load': {
         'createDisposition': 'CREATE_IF_NEEDED',
         'destinationTable': dict(table_reference),
-        'sourceUris': source_uris.split(','),
         }}
+    upload_file = None
+    if source.startswith('gs://'):
+      source_uris = source.split(',')
+      if any(not source_uri.startswith('gs://') for source_uri in source_uris):
+        raise app.UsageError('All URIs must begin with "gs://".')
+      load_request['load']['sourceUris'] = source_uris
+    else:
+      if not os.path.exists(source):
+        raise app.UsageError('Source file not found: %s' % (source,))
+      if not os.path.isfile(source):
+        raise app.UsageError('Source path is not a file: %s' % (source,))
+      upload_file = source
     if self.replace:
       if schema:
         raise app.UsageError('To truncate and update the schema, '
@@ -569,9 +600,11 @@ class _Load(BigqueryCmd):
       load_request['load']['schema'] = {'fields': schema}
     if self.field_delimiter:
       load_request['load']['fieldDelimiter'] = self.field_delimiter
+    if self.encoding:
+      load_request['load']['encoding'] = self.encoding
     if self.skip_leading_rows:
       load_request['load']['skipLeadingRows'] = self.skip_leading_rows
-    self.ExecuteJob(load_request)
+    self.ExecuteJob(load_request, upload_file)
 
 
 class _Query(BigqueryCmd):
@@ -609,12 +642,7 @@ class _Query(BigqueryCmd):
     result = self.ExecuteJob({'query': query_config})
     if not FLAGS.sync:
       return
-    destination_table = result['configuration']['query']['destinationTable']
-    formatter = _GetFormatterFromFlags(secondary_format='pretty')
-    for field in client.GetTableSchema(destination_table).get('fields', []):
-      formatter.AddField(field)
-    formatter.AddRows(client.ReadTableRows(destination_table))
-    formatter.Print()
+    _PrintTable(client, result['configuration']['query']['destinationTable'])
 
 
 class _Extract(BigqueryCmd):
@@ -700,7 +728,7 @@ class _List(BigqueryCmd):
         pass
     _Typecheck(reference, (types.NoneType, ProjectReference, DatasetReference),
                ('Invalid identifier "%s" for ls, cannot call list on object '
-                'of type %s') % (identifier, type(reference).typename))
+                'of type %s') % (identifier, type(reference).__name__))
 
     if self.d and isinstance(reference, DatasetReference):
       reference = reference.GetProjectReference()
@@ -782,7 +810,7 @@ class _Delete(BigqueryCmd):
 
     if isinstance(reference, TableReference) and self.r:
       raise app.UsageError(
-          'Cannot specify -r with "%s"' % (reference,))
+          'Cannot specify -r with %r' % (reference,))
 
     if not self.force:
       if ((isinstance(reference, DatasetReference) and
@@ -790,12 +818,12 @@ class _Delete(BigqueryCmd):
           (isinstance(reference, TableReference)
            and client.TableExists(reference))):
         # TODO(user): Replace with common prompt functionality.
-        msg = 'rm: remove %s? (y/N) ' % (reference,)
+        msg = 'rm: remove %r? (y/N) ' % (reference,)
         response = None
         while response not in ['y', 'n', '']:
           response = raw_input(msg).lower()
         if response != 'y':
-          print 'NOT deleting %s, exiting.' % (reference,)
+          print 'NOT deleting %r, exiting.' % (reference,)
           return 0
 
     if isinstance(reference, DatasetReference):
@@ -805,6 +833,34 @@ class _Delete(BigqueryCmd):
     elif isinstance(reference, TableReference):
       client.DeleteTable(reference,
                          ignore_not_found=self.force)
+
+
+class _Copy(BigqueryCmd):
+  usage = """cp <source_table> <dest_table>"""
+
+  def __init__(self, name, fv):
+    super(_Copy, self).__init__(name, fv)
+
+  def RunWithArgs(self, source_table, dest_table):
+    """Copies one table to another.
+
+    Examples:
+      bq cp dataset.old_table dataset2.new_table
+    """
+    client = Client.Get()
+
+    source_reference = client.GetTableReference(source_table)
+    dest_reference = client.GetTableReference(dest_table)
+
+    copy_config = {
+        'sourceTable': dict(source_reference),
+        'destinationTable': dict(dest_reference)
+        }
+    self.ExecuteJob({'copy': copy_config})
+    if not FLAGS.sync:
+      return
+    print "Table '%s' successfully copied to '%s'" % (source_reference,
+                                                      dest_reference)
 
 
 class _Make(BigqueryCmd):
@@ -853,24 +909,24 @@ class _Make(BigqueryCmd):
     else:
       reference = client.GetReference(identifier)
       _Typecheck(reference, (DatasetReference, TableReference),
-                 'Invalid identifier "%s" for mk.' % (identifier,))
+                 "Invalid identifier '%s' for mk." % (identifier,))
     if isinstance(reference, DatasetReference):
       if self.schema:
         raise app.UsageError('Cannot specify schema with a dataset.')
 
     if isinstance(reference, DatasetReference):
       if client.DatasetExists(reference):
-        message = 'Dataset %s already exists.' % (reference,)
+        message = "Dataset '%s' already exists." % (reference,)
         if not self.f:
           raise bigquery_client.BigqueryDuplicateError(message)
         else:
           print message
           return
       client.CreateDataset(reference, ignore_existing=True)
-      print 'Dataset %s successfully created.' % (reference,)
+      print "Dataset '%s' successfully created." % (reference,)
     elif isinstance(reference, TableReference):
       if client.TableExists(reference):
-        message = 'Table %s already exists.' % (reference,)
+        message = "Table '%s' already exists." % (reference,)
         if not self.f:
           raise bigquery_client.BigqueryDuplicateError(message)
         else:
@@ -881,7 +937,7 @@ class _Make(BigqueryCmd):
       else:
         schema = None
       client.CreateTable(reference, ignore_existing=True, schema=schema)
-      print 'Table %s successfully created.' % (reference,)
+      print "Table '%s' successfully created." % (reference,)
 
 
 class _Show(BigqueryCmd):
@@ -939,6 +995,30 @@ class _Show(BigqueryCmd):
       formatter.Print()
 
 
+class _Head(BigqueryCmd):
+  usage = """head [-n <max rows>] [<table identifier>]"""
+
+  def __init__(self, name, fv):
+    super(_Head, self).__init__(name, fv)
+    flags.DEFINE_integer(
+        'max_rows', 100,
+        'The number of rows to print when showing table data.',
+        short_name='n', flag_values=fv)
+
+  def RunWithArgs(self, identifier=''):
+    """Displays rows in a table.
+
+    Examples:
+      bq head dataset.table
+      bq head -n 10 dataset.table
+    """
+    client = Client.Get()
+    reference = client.GetReference(identifier)
+    _Typecheck(reference, (types.NoneType, TableReference),
+               'Must provide a table identifier for head.')
+    _PrintTable(client, dict(reference), max_rows=FLAGS.max_rows)
+
+
 class _Wait(BigqueryCmd):
   usage = """wait <job_id> [<secs>]"""
 
@@ -989,7 +1069,7 @@ class CommandLoop(cmd.Cmd):
   def _set_prompt(self):
     client = Client().Get()
     if client.project_id:
-      path = str(client.GetReference()).split("'")[1]
+      path = str(client.GetReference())
       self.prompt = '%s> ' % (path,)
     else:
       self.prompt = self._default_prompt
@@ -1031,7 +1111,7 @@ class CommandLoop(cmd.Cmd):
     words = line.strip().split()
     if len(words) > 1 and words[0].lower() == 'select':
       return ' '.join(['select'] + words[1:])
-    if len(words) == 1 and words[0] not in ['help', 'ls']:
+    if len(words) == 1 and words[0] not in ['help', 'ls', 'version']:
       return 'help %s' % (line.strip(),)
     return line
 
@@ -1203,7 +1283,7 @@ class _Init(BigqueryCmd):
         project_reference = BigqueryClient.ConstructObjectReference(
             projects[0])
         print 'Found only one project, setting %s as the default.' % (
-            project_reference.projectId,)
+            project_reference,)
         print
         entries['project_id'] = project_reference.projectId
       else:
@@ -1237,6 +1317,26 @@ class _Init(BigqueryCmd):
     return 0
 
 
+class _Version(BigqueryCmd):
+  usage = """version"""
+
+  @staticmethod
+  def VersionNumber():
+    """Return the version of bq."""
+    try:
+      import pkg_resources  # pylint:disable-msg=C6204
+      version = pkg_resources.get_distribution('bigquery').version
+      return 'v%s' % (version,)
+    except ImportError:
+      return '<unknown>'
+
+
+  def RunWithArgs(self):
+    """Return the version of bq."""
+    version = type(self).VersionNumber()
+    print 'This is BigQuery CLI %s' % (version,)
+
+
 def main(argv):
   try:
     FLAGS.auth_local_webserver = False
@@ -1250,14 +1350,17 @@ def main(argv):
     appcommands.AddCmd('rm', _Delete)
     appcommands.AddCmd('mk', _Make)
     appcommands.AddCmd('show', _Show)
+    appcommands.AddCmd('head', _Head)
     appcommands.AddCmd('wait', _Wait)
+    appcommands.AddCmd('cp', _Copy)
 
+    appcommands.AddCmd('version', _Version)
     appcommands.AddCmd('shell', _Repl)
     appcommands.AddCmd('init', _Init)
 
     if (not argv or
         (len(argv) > 1 and
-         argv[1] not in ['init', 'help'] and
+         argv[1] not in ['init', 'help', 'version'] and
          argv[1] in appcommands.GetCommandList())):
       if not (os.path.exists(_GetBigqueryRcFilename()) or
               os.path.exists(FLAGS.credential_file)):
@@ -1265,12 +1368,12 @@ def main(argv):
       Client.Get()
   except KeyboardInterrupt, e:
     print 'Control-C pressed, exiting.'
-    return 1
+    sys.exit(1)
   except BaseException, e:  # pylint:disable-msg=W0703
     print 'Error initializing bq client: %s' % (e,)
     if FLAGS.debug_mode:
       pdb.post_mortem()
-    return 1
+    sys.exit(1)
 
 
 # pylint: disable-msg=C6409
