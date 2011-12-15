@@ -32,27 +32,27 @@ import com.google.api.services.bigquery.Bigquery.Projects;
 import com.google.api.services.bigquery.Bigquery.Tabledata;
 import com.google.api.services.bigquery.Bigquery.Tables;
 import com.google.api.services.bigquery.BigqueryRequest;
-import com.google.api.services.bigquery.model.Bigqueryfield;
-import com.google.api.services.bigquery.model.Bigqueryschema;
 import com.google.api.services.bigquery.model.DatasetList;
 import com.google.api.services.bigquery.model.DatasetListDatasets;
-import com.google.api.services.bigquery.model.Datasetreference;
+import com.google.api.services.bigquery.model.DatasetReference;
 import com.google.api.services.bigquery.model.GetQueryResultsResponse;
 import com.google.api.services.bigquery.model.Job;
-import com.google.api.services.bigquery.model.Jobconfiguration;
-import com.google.api.services.bigquery.model.Jobconfigurationload;
-import com.google.api.services.bigquery.model.Jobconfigurationquery;
-import com.google.api.services.bigquery.model.Jobreference;
+import com.google.api.services.bigquery.model.JobConfiguration;
+import com.google.api.services.bigquery.model.JobConfigurationLoad;
+import com.google.api.services.bigquery.model.JobConfigurationQuery;
+import com.google.api.services.bigquery.model.JobReference;
 import com.google.api.services.bigquery.model.ProjectList;
 import com.google.api.services.bigquery.model.ProjectListProjects;
 import com.google.api.services.bigquery.model.QueryRequest;
 import com.google.api.services.bigquery.model.QueryResponse;
-import com.google.api.services.bigquery.model.Row;
-import com.google.api.services.bigquery.model.RowF;
 import com.google.api.services.bigquery.model.TableDataList;
+import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableList;
 import com.google.api.services.bigquery.model.TableListTables;
-import com.google.api.services.bigquery.model.Tablereference;
+import com.google.api.services.bigquery.model.TableReference;
+import com.google.api.services.bigquery.model.TableRow;
+import com.google.api.services.bigquery.model.TableRowF;
+import com.google.api.services.bigquery.model.TableSchema;
 import com.google.common.base.Preconditions;
 
 import com.beust.jcommander.IParameterValidator;
@@ -60,6 +60,7 @@ import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
 import com.beust.jcommander.ParameterException;
 import com.beust.jcommander.Parameters;
+import com.beust.jcommander.validators.PositiveInteger;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -72,6 +73,8 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+
+import javax.annotation.Nullable;
 
 /**
  * Demonstrates various Bigquery API calls using the Java API.
@@ -112,7 +115,7 @@ public class BigQuerySample {
   @Parameters(separators = "=", commandDescription = "List datasets")
   static class CommandLsDatasets implements Command {
 
-    @Parameter(names = {"--projectId"})
+    @Parameter(names = {"--projectId"}, required = true)
     public String projectId;
 
     @Override
@@ -136,10 +139,10 @@ public class BigQuerySample {
   @Parameters(separators = "=", commandDescription = "List tables")
   static class CommandLsTables implements Command {
 
-    @Parameter(names = {"--projectId"})
+    @Parameter(names = {"--projectId"}, required = true)
     public String projectId;
 
-    @Parameter(names = {"--datasetId"})
+    @Parameter(names = {"--datasetId"}, required = true)
     public String datasetId;
 
     @Parameter(names = {"--maxResults"})
@@ -169,45 +172,64 @@ public class BigQuerySample {
           + "Google Storage")
   static class CommandLoad implements Command {
 
-    @Parameter(names = {"--projectId"})
+    @Parameter(names = {"--projectId"}, required = true)
     public String projectId;
 
-    @Parameter(names = {"--datasetId"})
+    @Parameter(names = {"--datasetId"}, required = true)
     public String datasetId;
 
-    @Parameter(names = {"--tableId"})
+    @Parameter(names = {"--tableId"}, required = true)
     public String tableId;
 
-    @Parameter(names = {"--csvFile"}, validateWith = BigstoreValidator.class)
+    @Parameter(names = {"--csvFile"}, validateWith = BigstoreValidator.class, required = true)
     public String csvFile;
 
-    @Parameter(names = "--schemaFile", validateWith = FilenameValidator.class)
-    public String schemaFile;
+    @Parameter(names = "--schemaFile", validateWith = FilenameValidator.class, required = true)
+    public File schemaFile;
+
+    @Parameter(names = "--skipLeadingRows", validateWith = PositiveInteger.class)
+    public Integer skipLeadingRows;
+
+    @Parameter(names = "--maxBadRecords", validateWith = PositiveInteger.class)
+    public Integer maxBadRecords = 100;
+
+    @Parameter(names = "--encoding", description = "'UTF-8' or 'ISO-8859-1'")
+    public String encoding;
 
     @Override
     public void run(Bigquery bigquery) throws IOException {
       Job insertJob = new Job();
-      insertJob.setJobReference(new Jobreference().setProjectId(projectId));
+      insertJob.setJobReference(new JobReference().setProjectId(projectId));
 
-      Bigqueryschema schema = new Bigqueryschema();
-      schema.setFields(new ArrayList<Bigqueryfield>());
+      TableSchema schema = new TableSchema();
+      schema.setFields(new ArrayList<TableFieldSchema>());
       JACKSON.createJsonParser(new FileInputStream(schemaFile))
-          .parseArrayAndClose(schema.getFields(), Bigqueryfield.class, null);
-      Jobconfiguration configuration = new Jobconfiguration();
-      Jobconfigurationload load = new Jobconfigurationload();
+          .parseArrayAndClose(schema.getFields(), TableFieldSchema.class, null);
+      JobConfiguration configuration = new JobConfiguration();
+      JobConfigurationLoad load = new JobConfigurationLoad();
       load.setSchema(schema);
       load.setCreateDisposition("CREATE_IF_NEEDED");
-      Tablereference destinationTable = new Tablereference();
+      TableReference destinationTable = new TableReference();
       destinationTable.setProjectId(projectId);
       destinationTable.setDatasetId(datasetId);
       destinationTable.setTableId(tableId);
       load.setDestinationTable(destinationTable);
       load.setSourceUris(Arrays.asList(csvFile));
+      if (skipLeadingRows != null) {
+        load.setSkipLeadingRows(skipLeadingRows);
+      }
+      if (maxBadRecords != null) {
+        load.setMaxBadRecords(maxBadRecords);
+      }
+      if (encoding != null) {
+        load.setEncoding(encoding);
+      }
       configuration.setLoad(load);
       insertJob.setConfiguration(configuration);
 
       Insert insertReq = bigquery.jobs().insert(insertJob);
       insertReq.setProjectId(projectId);
+      println("Starting load job.");
       Job job = insertReq.execute();
       if (isJobRunning(job)) {
         Job doneJob = waitForJob(bigquery, projectId, job.getJobReference());
@@ -221,13 +243,13 @@ public class BigQuerySample {
   @Parameters(separators = "=", commandDescription = "Queries a table (async)")
   static class CommandQuery implements Command {
 
-    @Parameter(names = {"--projectId"})
+    @Parameter(names = {"--projectId"}, required = true)
     public String projectId;
 
-    @Parameter(names = {"--datasetId"})
+    @Parameter(names = {"--datasetId"}, required = true)
     public String datasetId;
 
-    @Parameter(names = {"--query"})
+    @Parameter(names = {"--query"}, required = true)
     public String query;
 
     @Parameter(names = {"--maxResults"})
@@ -236,11 +258,11 @@ public class BigQuerySample {
     @Override
     public void run(Bigquery bigquery) throws IOException {
       Job job = new Job();
-      Jobconfiguration config = new Jobconfiguration();
-      Jobconfigurationquery queryConfig = new Jobconfigurationquery();
+      JobConfiguration config = new JobConfiguration();
+      JobConfigurationQuery queryConfig = new JobConfigurationQuery();
       config.setQuery(queryConfig);
 
-      Datasetreference defaultDataset = new Datasetreference()
+      DatasetReference defaultDataset = new DatasetReference()
           .setDatasetId(datasetId)
           .setProjectId(projectId);
       queryConfig.setDefaultDataset(defaultDataset);
@@ -271,13 +293,13 @@ public class BigQuerySample {
   @Parameters(separators = "=", commandDescription = "Queries a table (sync)")
   static class CommandSyncQuery implements Command {
 
-    @Parameter(names = {"--projectId"})
+    @Parameter(names = {"--projectId"}, required = true)
     public String projectId;
 
-    @Parameter(names = {"--datasetId"})
+    @Parameter(names = {"--datasetId"}, required = true)
     public String datasetId;
 
-    @Parameter(names = {"--query"})
+    @Parameter(names = {"--query"}, required = true)
     public String query;
 
     @Parameter(names = {"--maxResults"})
@@ -286,7 +308,7 @@ public class BigQuerySample {
     @Override
     public void run(Bigquery bigquery) throws IOException {
       QueryRequest request = new QueryRequest();
-      Datasetreference defaultDataset = new Datasetreference()
+      DatasetReference defaultDataset = new DatasetReference()
           .setDatasetId(datasetId)
           .setProjectId(projectId);
       request.setDefaultDataset(defaultDataset);
@@ -446,8 +468,6 @@ public class BigQuerySample {
         query.run(provider.require());
       } else if ("squery".equals(parsedCommand)) {
         squery.run(provider.require());
-      } else if ("help".equals(parsedCommand)) {
-        help.run(jcom);
       } else {
         help.run(jcom);
       }
@@ -607,11 +627,13 @@ public class BigQuerySample {
     }
   }
 
-  private static Job waitForJob(Bigquery bigquery, String projectId, Jobreference jobRef)
+  private static Job waitForJob(Bigquery bigquery, String projectId, JobReference jobRef)
       throws IOException {
     while (true) {
       sleep();
       Job pollJob = bigquery.jobs().get(projectId, jobRef.getJobId()).execute();
+      println("Waiting on job %s ... Current status: %s", jobRef.getJobId(),
+          pollJob.getStatus().getState());
       if (!isJobRunning(pollJob)) {
         return pollJob;
       }
@@ -619,7 +641,6 @@ public class BigQuerySample {
   }
 
   private static void sleep() {
-    println("Waiting " + SLEEP_MILLIS + "ms");
     try {
       Thread.sleep(SLEEP_MILLIS);
     } catch (InterruptedException e) {
@@ -632,15 +653,15 @@ public class BigQuerySample {
         job.getStatus().getState().equals("PENDING");
   }
 
-  private static void printRows(Bigqueryschema schema, List<Row> rows) {
+  private static void printRows(@Nullable TableSchema schema, List<TableRow> rows) {
     if (schema != null) {
-      for (Bigqueryfield field : schema.getFields()) {
+      for (TableFieldSchema field : schema.getFields()) {
         print("%-20s", ellipsize(field.getName()));
       }
       println();
     }
-    for (Row row : rows) {
-      for (RowF cell : row.getF()) {
+    for (TableRow row : rows) {
+      for (TableRowF cell : row.getF()) {
         print("%-20s", ellipsize(cell.getV()));
       }
       println();
