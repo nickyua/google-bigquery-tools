@@ -534,6 +534,10 @@ class _Load(BigqueryCmd):
         'replace', False,
         'If true erase existing contents before loading new data.',
         flag_values=fv)
+    flags.DEFINE_integer(
+        'max_bad_records', 0,
+        'Maximum number of bad records allowed before the entire job fails.',
+        flag_values=fv)
 
   def RunWithArgs(self, destination_table, source, schema=None):
     """Perform a load operation of source into destination_table.
@@ -604,6 +608,9 @@ class _Load(BigqueryCmd):
       load_request['load']['encoding'] = self.encoding
     if self.skip_leading_rows:
       load_request['load']['skipLeadingRows'] = self.skip_leading_rows
+    if self.max_bad_records > 0:
+      load_request['load']['maxBadRecords'] = self.max_bad_records
+
     self.ExecuteJob(load_request, upload_file)
 
 

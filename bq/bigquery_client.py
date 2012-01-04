@@ -290,7 +290,7 @@ class BigqueryClient(object):
     """
     # We need to handle the case of a lone project identifier of the
     # form domain.com:proj separately.
-    if re.search('^[\w.]+\.[\w.]+:\w*:?$', identifier):
+    if re.search('^\w[\w.]*\.[\w.]+:\w[\w\d_-]*:?$', identifier):
       return identifier, '', ''
     project_id, _, dataset_and_table_id = identifier.rpartition(':')
     # Note that the two below only differ in the case that '.' is not
@@ -391,7 +391,7 @@ class BigqueryClient(object):
     temp_upload_file = os.path.join(temp_dir, 'data.bin')
     if os.name == 'posix':
       # On Unix, just symlink the file.
-      os.symlink(upload_file, temp_upload_file)
+      os.symlink(os.path.realpath(upload_file), temp_upload_file)
     else:
       # Since Python doesn't support Windows symlinks, we copy the file, but
       # warn the user if the file is large.
@@ -744,8 +744,9 @@ class BigqueryClient(object):
     result.update(dict(reference))
     if 'startTime' in result.get('statistics', {}):
       start = int(result['statistics']['startTime']) / 1000
-      duration_seconds = int(result['statistics']['endTime']) / 1000 - start
-      result['Duration'] = str(datetime.timedelta(seconds=duration_seconds))
+      if 'endTime' in result['statistics']:
+        duration_seconds = int(result['statistics']['endTime']) / 1000 - start
+        result['Duration'] = str(datetime.timedelta(seconds=duration_seconds))
       result['Start Time'] = BigqueryClient.FormatTime(start)
     result['Job Type'] = BigqueryClient.GetJobTypeName(result)
     result['State'] = result['status']['state']
