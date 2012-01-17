@@ -77,6 +77,8 @@ class MainHandler(webapp.RequestHandler):
 
     @decorator.oauth_required
     def get(self):
+        logging.info('Last mod time: %s' % bq.getLastModTime(
+            PROJECT_ID, DATASET, TABLE))
         data = { 'data': self._bq2geo(bq.Query(QUERY, PROJECT_ID)),
                  'query': QUERY }
         template = os.path.join(os.path.dirname(__file__), 'index.html')
