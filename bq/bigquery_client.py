@@ -10,7 +10,9 @@ import itertools
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 
 
@@ -25,9 +27,13 @@ import httplib2
 json = anyjson.simplejson
 
 
-def _Typecheck(obj, types, message=None):  # pylint:disable-msg=W0621
+def _Typecheck(obj, types, message=None, method=None):
   if not isinstance(obj, types):
-    message = message or 'Type of %s is not one of %s' % (obj, types)
+    if not message:
+      if method:
+        message = 'Invalid reference for %s: %r' % (method, obj)
+      else:
+        message = 'Type of %r is not one of %s' % (obj, types)
     raise TypeError(message)
 
 
@@ -284,7 +290,7 @@ class BigqueryClient(object):
     """
     # We need to handle the case of a lone project identifier of the
     # form domain.com:proj separately.
-    if re.search('^[\w.]+\.[\w.]+:\w*:?$', identifier):
+    if re.search('^\w[\w.]*\.[\w.]+:\w[\w\d_-]*:?$', identifier):
       return identifier, '', ''
     project_id, _, dataset_and_table_id = identifier.rpartition(':')
     # Note that the two below only differ in the case that '.' is not
@@ -380,7 +386,29 @@ class BigqueryClient(object):
       pass
     raise BigqueryError('Cannot determine reference for "%s"' % (identifier,))
 
-  def StartJob(self, configuration, project_id=None):
+  @staticmethod
+  def _SymlinkOrCopy(upload_file, temp_dir):
+    temp_upload_file = os.path.join(temp_dir, 'data.bin')
+    if os.name == 'posix':
+      # On Unix, just symlink the file.
+      os.symlink(os.path.realpath(upload_file), temp_upload_file)
+    else:
+      # Since Python doesn't support Windows symlinks, we copy the file, but
+      # warn the user if the file is large.
+      size = os.stat(upload_file).st_size / (1024 * 1024)
+      if size > 10:
+        print 'To complete this operation, the BigQuery CLI needs to create a'
+        print 'temporary file that is %d MB in size.' % (size,)
+        print
+        response = None
+        while response not in ['y', 'n', '']:
+          response = raw_input('Proceed? (Y/n) ').lower()
+        if response == 'n':
+          raise BigqueryError('Operation cancelled by user.')
+      shutil.copy(upload_file, temp_upload_file)
+    return temp_upload_file
+
+  def StartJob(self, configuration, project_id=None, upload_file=None):
     """Start a job with the given configuration."""
     project_id = project_id or self.project_id
     if not project_id:
@@ -392,12 +420,35 @@ class BigqueryClient(object):
       configuration['properties'] = dict(
           prop.partition('=')[0::2] for prop in self.job_property)
     job_request = {'configuration': configuration}
-    result = self.apiclient.jobs().insert(
-        body=job_request, projectId=project_id).execute()
+    try:
+      temp_dir = None
+      temp_upload_file = None
+
+      if upload_file:
+        # The API client determines the MIME type from the file suffix.
+        # Since uploads must have MIME type application/octet-stream
+        # (for now), we symlink (or copy, on Windows) the input file to
+        # a temporary file with the appropriate suffix.
+        # TODO(user): Remove all tempfile nonsense once the API
+        # client allows us to specify the MIME type.
+        temp_dir = tempfile.mkdtemp()
+        temp_upload_file = self._SymlinkOrCopy(upload_file, temp_dir)
+
+      # TODO(user): Figure out a way to show upload progress.
+      result = self.apiclient.jobs().insert(
+          body=job_request, media_body=temp_upload_file,
+          projectId=project_id).execute()
+    finally:
+      if temp_upload_file:
+        os.remove(temp_upload_file)
+      if temp_dir:
+        os.rmdir(temp_dir)
     return result
 
-  def RunJobSynchronously(self, configuration, project_id=None):
-    result = self.StartJob(configuration, project_id=project_id)
+  def RunJobSynchronously(self, configuration, project_id=None,
+                          upload_file=None):
+    result = self.StartJob(configuration, project_id=project_id,
+                           upload_file=upload_file)
     job_reference = BigqueryClient.ConstructObjectReference(result)
     result = self.WaitJob(job_reference)
     return self.RaiseIfJobError(result)
@@ -431,14 +482,11 @@ class BigqueryClient(object):
         sys.stdout.flush()
       return printed
 
-    _Typecheck(job_reference, ApiClientHelper.JobReference,
-               'Invalid job reference for WaitJob: %s' % (job_reference,))
+    _Typecheck(job_reference, ApiClientHelper.JobReference, method='WaitJob')
     # TODO(user): Change the defaults for this function.
     current = 'UNKNOWN'
-    jobs = self.apiclient.jobs()
     start_time = time.time()
     job = None
-    wait = BigqueryClient.NormalizeWait(wait)
     print_status = print_status and not self.quiet
 
     # This is a first pass at wait logic: we ping at 1s intervals a few
@@ -451,9 +499,8 @@ class BigqueryClient(object):
     current_wait = 0
     while current_wait <= wait:
       try:
-        job = jobs.get(**dict(job_reference)).execute()
-        current = job['status']['state']
-        if current == status:
+        done, job = self.PollJob(job_reference, status=status, wait=wait)
+        if done:
           PrintStatus(job_reference.jobId, current_wait, job['status']['state'])
           break
       except BigqueryCommunicationError, e:
@@ -470,6 +517,29 @@ class BigqueryClient(object):
       print
     return job
 
+  def PollJob(self, job_reference, status='DONE', wait=0):
+    """Poll a job once for a specific status.
+
+    Arguments:
+      job_reference: JobReference to poll.
+      status: (optional, default 'DONE') Desired job status.
+      wait: (optional, default 0) Max server-side wait time for one poll call.
+
+    Returns:
+      Tuple (in_state, job) where in_state is True if job is
+      in the desired state.
+
+    Raises:
+      ValueError: If given an invalid wait value.
+    """
+    _Typecheck(job_reference, ApiClientHelper.JobReference, method='PollJob')
+    wait = BigqueryClient.NormalizeWait(wait)
+    # TODO(user): Wire in wait once the server supports wait
+    # timeouts on get requests.
+    job = self.apiclient.jobs().get(**dict(job_reference)).execute()
+    current = job['status']['state']
+    return (current == status, job)
+
   def GetObjectInfo(self, reference):
     """Get all data returned by the server about a specific object."""
     # Projects are handled separately, because we only have
@@ -480,8 +550,7 @@ class BigqueryClient(object):
         if BigqueryClient.ConstructObjectReference(project) == reference:
           project['kind'] = 'bigquery#project'
           return project
-      else:
-        raise BigqueryError('Unknown project: %s' % (reference.projectId,))
+      raise BigqueryNotFoundError('Unknown %r' % (reference,))
 
     if isinstance(reference, ApiClientHelper.JobReference):
       return self.apiclient.jobs().get(**dict(reference)).execute()
@@ -497,20 +566,36 @@ class BigqueryClient(object):
     table_info = self.apiclient.tables().get(**table_dict).execute()
     return table_info.get('schema', {})
 
-  def ReadTableRows(self, table_dict):
-    """Read all rows from a table."""
+  def ReadTableRows(self, table_dict, max_rows=sys.maxint):
+    """Read at most max_rows rows from a table."""
     rows = []
-    data = {'totalRows': 1}  # Fake data to force entry into the loop
-    while len(rows) < int(data['totalRows']):
+    while len(rows) < max_rows:
       data = self.apiclient.tabledata().list(
-          maxResults=1000, startIndex=len(rows), **table_dict).execute()
-      for row in data.get('rows', {}):
-        rows.append([entry.get('v', '') for entry in row.get('f', {})])
-      if not data.get('rows', []) and len(rows) != int(data['totalRows']):
+          maxResults=min(10000, max_rows - len(rows)),
+          startIndex=len(rows), **table_dict).execute()
+      max_rows = min(max_rows, int(data['totalRows']))
+      more_rows = data.get('rows', [])
+      for row in more_rows:
+        rows.append([entry.get('v', '') for entry in row.get('f', [])])
+      if not more_rows and len(rows) != max_rows:
         raise BigqueryInterfaceError(
-            'Not enough rows returned by server for %s' % (
+            'Not enough rows returned by server for %r' % (
                 ApiClientHelper.TableReference.Create(**table_dict),))
     return rows
+
+  def ReadSchemaAndRows(self, table_dict, max_rows=sys.maxint):
+    """Convenience method to get the schema and rows from a table.
+
+    Arguments:
+      table_dict: table reference dictionary.
+      max_rows: number of rows to read.
+
+    Returns:
+      A tuple where the first item is the list of fields and the
+      second item a list of rows.
+    """
+    return (self.GetTableSchema(table_dict).get('fields', []),
+            self.ReadTableRows(table_dict, max_rows))
 
   @staticmethod
   def ConfigureFormatter(formatter, reference_type, print_format='list'):
@@ -659,8 +744,9 @@ class BigqueryClient(object):
     result.update(dict(reference))
     if 'startTime' in result.get('statistics', {}):
       start = int(result['statistics']['startTime']) / 1000
-      duration_seconds = int(result['statistics']['endTime']) / 1000 - start
-      result['Duration'] = str(datetime.timedelta(seconds=duration_seconds))
+      if 'endTime' in result['statistics']:
+        duration_seconds = int(result['statistics']['endTime']) / 1000 - start
+        result['Duration'] = str(datetime.timedelta(seconds=duration_seconds))
       result['Start Time'] = BigqueryClient.FormatTime(start)
     result['Job Type'] = BigqueryClient.GetJobTypeName(result)
     result['State'] = result['status']['state']
@@ -757,8 +843,7 @@ class BigqueryClient(object):
 
   def ListJobs(self, reference):
     """Return a list of jobs."""
-    _Typecheck(reference, ApiClientHelper.ProjectReference,
-               'Invalid reference for ListJobs: %s' % (reference,))
+    _Typecheck(reference, ApiClientHelper.ProjectReference, method='ListJobs')
     request = dict(reference)
     request['projection'] = 'full'
     jobs = self.apiclient.jobs().list(**dict(request)).execute()
@@ -772,20 +857,36 @@ class BigqueryClient(object):
   def ListDatasets(self, reference):
     """List the datasets associated with this reference."""
     _Typecheck(reference, ApiClientHelper.ProjectReference,
-               'Invalid reference for ListDatasets: %s' % (reference,))
+               method='ListDatasets')
     result = self.apiclient.datasets().list(**dict(reference)).execute()
     return result.get('datasets', [])
 
   def ListTables(self, reference):
     """List the tables associated with this reference."""
-    _Typecheck(reference, ApiClientHelper.DatasetReference,
-               'Invalid reference for ListTables: %s' % (reference,))
+    _Typecheck(reference, ApiClientHelper.DatasetReference, method='ListTables')
     result = self.apiclient.tables().list(**dict(reference)).execute()
     return result.get('tables', [])
 
+  def CopyTable(self, source_reference, dest_reference):
+    """Copies a table."""
+    _Typecheck(source_reference, ApiClientHelper.TableReference,
+               method='CopyTable')
+    _Typecheck(dest_reference, ApiClientHelper.TableReference,
+               method='CopyTable')
+    keywords = {
+        'sourceProjectId': source_reference.projectId,
+        'sourceDatasetId': source_reference.datasetId,
+        'sourceTableId': source_reference.tableId
+        }
+    request = {
+        'destinationTable': dict(dest_reference)
+        }
+    self.apiclient.tables().copy(body=request,
+                                 **keywords).execute()
+
   def DatasetExists(self, reference):
     _Typecheck(reference, ApiClientHelper.DatasetReference,
-               'Invalid reference for DatasetExists: %s' % (reference,))
+               method='DatasetExists')
     try:
       self.apiclient.datasets().get(**dict(reference)).execute()
       return True
@@ -793,8 +894,7 @@ class BigqueryClient(object):
       return False
 
   def TableExists(self, reference):
-    _Typecheck(reference, ApiClientHelper.TableReference,
-               'Invalid reference for TableExists: %s' % (reference,))
+    _Typecheck(reference, ApiClientHelper.TableReference, method='TableExists')
     try:
       self.apiclient.tables().get(**dict(reference)).execute()
       return True
@@ -815,7 +915,7 @@ class BigqueryClient(object):
         is False.
     """
     _Typecheck(reference, ApiClientHelper.DatasetReference,
-               'Invalid reference for CreateDataset: %s' % (reference,))
+               method='CreateDataset')
 
     try:
       self.apiclient.datasets().insert(
@@ -839,8 +939,7 @@ class BigqueryClient(object):
       BigqueryDuplicateError: if reference exists and ignore_existing
         is False.
     """
-    _Typecheck(reference, ApiClientHelper.TableReference,
-               'Invalid reference for CreateTable: %s' % (reference,))
+    _Typecheck(reference, ApiClientHelper.TableReference, method='CreateTable')
 
     try:
       body = BigqueryClient.ConstructObjectInfo(reference)
@@ -871,7 +970,7 @@ class BigqueryClient(object):
         ignore_not_found is False.
     """
     _Typecheck(reference, ApiClientHelper.DatasetReference,
-               'Invalid reference for DeleteDataset: %s' % (reference,))
+               method='DeleteDataset')
 
     args = dict(reference)
     if delete_contents is not None:
@@ -894,8 +993,7 @@ class BigqueryClient(object):
       BigqueryNotFoundError: if reference does not exist and
         ignore_not_found is False.
     """
-    _Typecheck(reference, ApiClientHelper.TableReference,
-               'Invalid reference for DeleteTable: %s' % (reference,))
+    _Typecheck(reference, ApiClientHelper.TableReference, method='DeleteTable')
     try:
       self.apiclient.tables().delete(**dict(reference)).execute()
     except BigqueryNotFoundError:
@@ -937,6 +1035,9 @@ class ApiClientHelper(object):
     def __str__(self):
       return self._format_str % dict(self)
 
+    def __repr__(self):
+      return "%s '%s'" % (self.typename, self)
+
     def __eq__(self, other):
       d = dict(other)
       return all(getattr(self, name) == d.get(name, '')
@@ -944,17 +1045,17 @@ class ApiClientHelper(object):
 
   class JobReference(Reference):
     _required_fields = set(('projectId', 'jobId'))
-    _format_str = "job '%(jobId)s'"
+    _format_str = '%(jobId)s'
     typename = 'job'
 
   class ProjectReference(Reference):
     _required_fields = set(('projectId',))
-    _format_str = "project '%(projectId)s'"
+    _format_str = '%(projectId)s'
     typename = 'project'
 
   class DatasetReference(Reference):
     _required_fields = set(('projectId', 'datasetId'))
-    _format_str = "dataset '%(projectId)s:%(datasetId)s'"
+    _format_str = '%(projectId)s:%(datasetId)s'
     typename = 'dataset'
 
     def GetProjectReference(self):
@@ -963,7 +1064,7 @@ class ApiClientHelper(object):
 
   class TableReference(Reference):
     _required_fields = set(('projectId', 'datasetId', 'tableId'))
-    _format_str = "table '%(projectId)s:%(datasetId)s.%(tableId)s'"
+    _format_str = '%(projectId)s:%(datasetId)s.%(tableId)s'
     typename = 'table'
 
     def GetDatasetReference(self):

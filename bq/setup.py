@@ -39,8 +39,10 @@ py_version = platform.python_version()
 if py_version < '2.6.5' or py_version >= '3':
   raise ValueError('BigQuery requires Python >= 2.6.5.')
 
+_BQ_VERSION = '2.0.2'
+
 setup(name='bigquery',
-      version='2.0.0',
+      version=_BQ_VERSION,
       description='BigQuery command-line tool',
       url='http://code.google.com/p/bigquery/',
       py_modules=[
@@ -53,5 +55,5 @@ setup(name='bigquery',
           },
       install_requires=REQUIRED_PACKAGES,
       provides=[
-          'bigquery (2.0.0)',
+          'bigquery (%s)' % (_BQ_VERSION,),
           ])

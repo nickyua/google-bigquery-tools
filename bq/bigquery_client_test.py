@@ -21,6 +21,7 @@ class BigqueryClientTest(googletest.TestCase):
     self.reference_tests = {
         'prj:': ('prj', '', ''),
         'example.com:prj': ('example.com:prj', '', ''),
+        'example.com:prj-2': ('example.com:prj-2', '', ''),
         'www.example.com:prj': ('www.example.com:prj', '', ''),
         'prj:ds': ('prj', 'ds', ''),
         'example.com:prj:ds': ('example.com:prj', 'ds', ''),

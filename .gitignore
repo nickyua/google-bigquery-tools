@@ -1,0 +1,8 @@
+# Maven output directories
+target/
+output/
+# IntelliJ files
+*.iml
+*.ipr
+*.iws
+.idea/
