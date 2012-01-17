@@ -31,13 +31,14 @@ from oauth2client.appengine import oauth2decorator_from_clientsecrets
 # Console <http://code.google.com/apis/console>
 CLIENT_SECRETS = os.path.join(os.path.dirname(__file__), 'client_secrets.json')
 
-# Project ID for a project where you and your users
+# BILLING_PROJECT_ID for a project where you and your users
 #   are viewing members.  This is where the bill will be sent.
 #   During the limited availability preview, there is no bill.
-# Replace this value with the Client ID value from your project,
-#   the same numeric value you used in client_secrets.json
-PROJECT_ID = "99999999"
-DATASET = "publicdata:samples"
+# Replace the BILLING_PROJECT_ID value with the Client ID value
+# from your project, the same numeric value you used in client_secrets.json
+BILLING_PROJECT_ID = "99999999999"
+DATA_PROJECT_ID = "publicdata"
+DATASET = "samples"
 TABLE = "natality"
 QUERY = """
 select state, SUM(gestation_weeks) / COUNT(gestation_weeks) as weeks 
@@ -78,8 +79,8 @@ class MainHandler(webapp.RequestHandler):
     @decorator.oauth_required
     def get(self):
         logging.info('Last mod time: %s' % bq.getLastModTime(
-            PROJECT_ID, DATASET, TABLE))
-        data = { 'data': self._bq2geo(bq.Query(QUERY, PROJECT_ID)),
+            DATA_PROJECT_ID, DATASET, TABLE))
+        data = { 'data': self._bq2geo(bq.Query(QUERY, BILLING_PROJECT_ID)),
                  'query': QUERY }
         template = os.path.join(os.path.dirname(__file__), 'index.html')
         self.response.out.write(render(template, data))
