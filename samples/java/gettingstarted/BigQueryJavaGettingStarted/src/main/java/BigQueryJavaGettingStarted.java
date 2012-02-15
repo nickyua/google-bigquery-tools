@@ -56,13 +56,13 @@ public class BigQueryJavaGettingStarted {
 
   /////////////////////////
   // USER GENERATED FILES: you must fill in values specific to your application
-  // 
+  //
   // Visit the Google API Console to create a Project and generate an
   // OAuth 2.0 Client ID and Secret (http://code.google.com/apis/console)
   /////////////////////////
-  private static final String CLIENT_ID = "686269325431.apps.googleusercontent.com";
-  private static final String CLIENT_SECRET = "1WpZoD3XYcn0fl_i9UMokcCv";
-  private static final String PROJECT_ID = "686269325431";
+  private static final String CLIENT_ID = "";
+  private static final String CLIENT_SECRET = "";
+  private static final String PROJECT_ID = "";
 
   // Static variables for API scope, callback URI, and HTTP/JSON functions
   private static final String SCOPE = "https://www.googleapis.com/auth/bigquery";
