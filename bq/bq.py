@@ -21,8 +21,8 @@ import types
 # doesn't do this itself.
 
 
-from apiclient import anyjson
 import oauth2client
+from oauth2client import anyjson
 import oauth2client.client
 import oauth2client.file
 import oauth2client.tools
@@ -123,6 +123,19 @@ _CLIENT_INFO = {
     'client_secret': 'wbER7576mc_1YOII0dGk7jEE',
     'scope': _CLIENT_SCOPE,
     'user_agent': _CLIENT_USER_AGENT,
+    }
+_BIGQUERY_TOS_MESSAGE = (
+    'In order to get started, please visit the Google APIs Console to '
+    'create a project and agree to our Terms of Service:\n'
+    '\thttp://code.google.com/apis/console\n\n'
+    'For detailed sign-up instructions, please see our Getting Started '
+    'Guide:\n'
+    '\thttps://developers.google.com/bigquery/docs/getting-started\n\n'
+    'Once you have completed the sign-up process, please try your command '
+    'again.')
+_DELIMITER_MAP = {
+    'tab': '\t',
+    '\\t': '\t',
     }
 
 # These aren't relevant for user-facing docstrings:
@@ -237,8 +250,20 @@ def _GetCredentialsFromFlags():
     print '** No OAuth2 credentials found, beginning authorization process **'
     print '******************************************************************'
     print
-    flow = oauth2client.client.OAuth2WebServerFlow(**_CLIENT_INFO)
-    credentials = oauth2client.tools.run(flow, storage)
+    while True:
+      # If authorization fails, we want to retry, rather than let this
+      # cascade up and get caught elsewhere. If users want out of the
+      # retry loop, they can ^C.
+      try:
+        flow = oauth2client.client.OAuth2WebServerFlow(**_CLIENT_INFO)
+        credentials = oauth2client.tools.run(flow, storage)
+        break
+      except (oauth2client.client.FlowExchangeError, SystemExit), e:
+        # Here SystemExit is "no credential at all", and the
+        # FlowExchangeError is "invalid" -- usually because you reused
+        # a token.
+        print 'Invalid authorization: %s' % (e,)
+        print
     print
     print '************************************************'
     print '** Continuing execution of BigQuery operation **'
@@ -263,6 +288,7 @@ def _PrintTable(client, table_dict, **extra_args):
 
 
 class Client(object):
+  """Class wrapping a singleton bigquery_client.BigqueryClient."""
   client = None
 
   @classmethod
@@ -286,6 +312,15 @@ class Client(object):
         # Convert constructor parameter errors into flag usage errors.
         raise app.UsageError(e)
     return cls.client
+
+  @classmethod
+  def Delete(cls):
+    """Delete the existing client.
+
+    This is needed when flags have changed, and we need to force
+    client recreation to reflect new flag values.
+    """
+    cls.client = None
 
 
 def _Typecheck(obj, types, message=None):  # pylint:disable-msg=W0621
@@ -465,6 +500,9 @@ class BigqueryCmd(NewCmd):
                       bigquery_client.BigqueryDuplicateError)):
       response.append('BigQuery error in %s operation: %s' % (name, message))
       retcode = 2
+    elif isinstance(e, bigquery_client.BigqueryTermsOfServiceError):
+      response.append(str(e) + '\n')
+      response.append(_BIGQUERY_TOS_MESSAGE)
     elif isinstance(e, bigquery_client.BigqueryInvalidQueryError):
       response.append('Error in query string: %s' % (message,))
     elif isinstance(e, bigquery_client.BigqueryInterfaceError):
@@ -512,7 +550,7 @@ class _Load(BigqueryCmd):
     flags.DEFINE_string(
         'field_delimiter', None,
         'The character that indicates the boundary between columns in the '
-        'input file.',
+        'input file. "\t" and "tab" are accepted names for tab.',
         short_name='F', flag_values=fv)
     flags.DEFINE_enum(
         'encoding', None,
@@ -595,14 +633,14 @@ class _Load(BigqueryCmd):
         raise app.UsageError('Source path is not a file: %s' % (source,))
       upload_file = source
     if self.replace:
-      if schema:
-        raise app.UsageError('To truncate and update the schema, '
-                             'first delete the table.')
       load_request['load']['writeDisposition'] = 'WRITE_TRUNCATE'
     if schema:
       schema = bigquery_client.BigqueryClient.ReadSchema(schema)
       load_request['load']['schema'] = {'fields': schema}
     if self.field_delimiter:
+      key = self.field_delimiter.lower()
+      self.field_delimiter = _DELIMITER_MAP.get(
+          key, self.field_delimiter)
       load_request['load']['fieldDelimiter'] = self.field_delimiter
     if self.encoding:
       load_request['load']['encoding'] = self.encoding
@@ -634,6 +672,9 @@ class _Query(BigqueryCmd):
       query <sql_query>
     """
     client = Client.Get()
+    if not args:
+      raise bigquery_client.BigqueryInvalidQueryError(
+          'No query string provided')
     query_config = {'query': ' '.join(args)}
     if client.dataset_id:
       query_config['defaultDataset'] = dict(client.GetDatasetReference())
@@ -677,7 +718,7 @@ class _Extract(BigqueryCmd):
 
 
 class _List(BigqueryCmd):
-  usage = """ls [-l] [(-j|-p|-d|-t)] [<identifier>]"""
+  usage = """ls [(-j|-p|-d)] [-n <number>] [<identifier>]"""
 
   def __init__(self, name, fv):
     super(_List, self).__init__(name, fv)
@@ -685,6 +726,10 @@ class _List(BigqueryCmd):
         'jobs', False,
         'Show jobs described by this identifier.',
         short_name='j', flag_values=fv)
+    flags.DEFINE_integer(
+        'max_results', None,
+        'Maximum number to list.',
+        short_name='n', flag_values=fv)
     flags.DEFINE_boolean(
         'projects', False,
         'Show all projects.',
@@ -705,7 +750,7 @@ class _List(BigqueryCmd):
     Examples:
       bq ls
       bq ls -j proj
-      bq ls -p
+      bq ls -p -n 1000
       bq ls mydataset
     """
     if self.j and self.p:
@@ -747,16 +792,24 @@ class _List(BigqueryCmd):
       project_reference = client.GetProjectReference(identifier)
       BigqueryClient.ConfigureFormatter(formatter, JobReference)
       results = map(  # pylint:disable-msg=C6402
-          client.FormatJobInfo, client.ListJobs(reference=project_reference))
+          client.FormatJobInfo,
+          client.ListJobs(reference=project_reference,
+                          max_results=self.max_results))
     elif self.p or reference is None:
       BigqueryClient.ConfigureFormatter(formatter, ProjectReference)
-      results = map(client.FormatProjectInfo, client.ListProjects())
+      results = map(  # pylint:disable-msg=C6402
+          client.FormatProjectInfo,
+          client.ListProjects(max_results=self.max_results))
     elif isinstance(reference, ProjectReference):
       BigqueryClient.ConfigureFormatter(formatter, DatasetReference)
-      results = map(client.FormatDatasetInfo, client.ListDatasets(reference))
+      results = map(  # pylint:disable-msg=C6402
+          client.FormatDatasetInfo,
+          client.ListDatasets(reference, max_results=self.max_results))
     else:  # isinstance(reference, DatasetReference):
       BigqueryClient.ConfigureFormatter(formatter, TableReference)
-      results = map(client.FormatTableInfo, client.ListTables(reference))
+      results = map(  # pylint:disable-msg=C6402
+          client.FormatTableInfo,
+          client.ListTables(reference, max_results=self.max_results))
 
     for result in results:
       formatter.AddDict(result)
@@ -1023,20 +1076,22 @@ class _Head(BigqueryCmd):
     reference = client.GetReference(identifier)
     _Typecheck(reference, (types.NoneType, TableReference),
                'Must provide a table identifier for head.')
-    _PrintTable(client, dict(reference), max_rows=FLAGS.max_rows)
+    _PrintTable(client, dict(reference), max_rows=self.max_rows)
 
 
 class _Wait(BigqueryCmd):
-  usage = """wait <job_id> [<secs>]"""
+  usage = """wait [<job_id>] [<secs>]"""
 
-  def RunWithArgs(self, job_id, secs=sys.maxint):
+  def RunWithArgs(self, job_id='', secs=sys.maxint):
     """Wait some number of seconds for a job to finish.
 
     Poll job_id until either (1) the job is DONE or (2) the
     specified number of seconds have elapsed. Waits forever
-    if unspecified.
+    if unspecified. If no job_id is specified, and there is
+    only one running job, we poll that job.
 
     Examples:
+      bq wait # Waits forever for the currently running job.
       bq wait job_id  # Waits forever
       bq wait job_id 100  # Waits 100 seconds
       bq wait job_id 0  # See if a job is done.
@@ -1051,8 +1106,24 @@ class _Wait(BigqueryCmd):
       raise app.UsageError('Invalid wait time: %s' % (secs,))
 
     client = Client.Get()
-    job_reference = JobReference.Create(
-        project_id=self.GetProjectReference(), job_id=job_id)
+    project_ref = client.GetProjectReference()
+    if not job_id:
+      # TODO(user): Fix this once a new version of apiclient
+      # This is a mild hack: there seems to be a bug in the discovery
+      # client involving repeated enum fields, so we make two calls.
+      # (Do not stare directly at the race condition, it may cause
+      # blindness.)
+      running_jobs = client.ListJobs(
+          reference=project_ref, state_filter='RUNNING')
+      running_jobs.extend(client.ListJobs(
+          reference=project_ref, state_filter='PENDING'))
+      if len(running_jobs) == 1:
+        job_id = running_jobs[0].get('jobReference', {}).get('jobId')
+      else:
+        raise bigquery_client.BigqueryError(
+            'No job_id provided, found %d running jobs' % (len(running_jobs),))
+
+    job_reference = JobReference.Create(projectId=project_ref, jobId=job_id)
     client.WaitJob(job_reference=job_reference, wait=secs)
 
 
@@ -1321,6 +1392,9 @@ class _Init(BigqueryCmd):
     print 'BigQuery configuration complete! Type "bq" to get started.'
     print
     _ProcessBigqueryrc()
+    # Destroy the client we created, so that any new client will
+    # pick up new flag values.
+    Client.Delete()
     return 0
 
 

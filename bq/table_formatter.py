@@ -75,7 +75,7 @@ import itertools
 import sys
 
 
-from apiclient import anyjson
+from oauth2client import anyjson
 
 json = anyjson.simplejson
 

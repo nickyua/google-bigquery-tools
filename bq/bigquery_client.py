@@ -17,12 +17,11 @@ import time
 
 
 import apiclient
-from apiclient import anyjson
 from apiclient import discovery
 from apiclient import http as http_request
 from apiclient import model
-
 import httplib2
+from oauth2client import anyjson
 
 json = anyjson.simplejson
 
@@ -61,6 +60,8 @@ class BigqueryError(Exception):
       return BigqueryAccessDeniedError(message)
     if reason == 'invalidQuery':
       return BigqueryInvalidQueryError(message)
+    if reason == 'termsOfServiceNotAccepted':
+      return BigqueryTermsOfServiceError(message)
     # We map the less interesting errors to BigqueryServiceError.
     return BigqueryServiceError(message)
 
@@ -108,7 +109,8 @@ class BigqueryInvalidQueryError(BigqueryServiceError):
   pass
 
 
-class BigqueryTableError(BigqueryError):
+class BigqueryTermsOfServiceError(BigqueryAccessDeniedError):
+  """User has not ACK'd ToS."""
   pass
 
 
@@ -192,11 +194,14 @@ class BigqueryClient(object):
       if self.discovery_document is None:
         discovery_url = '%s/discovery/v1/apis/{api}/{apiVersion}/rest' % (
             self.api,)
-        self._apiclient = discovery.build(
-            'bigquery', self.api_version, http=http,
-            discoveryServiceUrl=discovery_url,
-            model=bigquery_model,
-            requestBuilder=bigquery_http)
+        try:
+          self._apiclient = discovery.build(
+              'bigquery', self.api_version, http=http,
+              discoveryServiceUrl=discovery_url,
+              model=bigquery_model,
+              requestBuilder=bigquery_http)
+        except httplib2.ServerNotFoundError, e:
+          raise BigqueryCommunicationError(str(e))
       else:
         self._apiclient = discovery.build_from_document(
             self.discovery_document, self.api, http=http,
@@ -617,6 +622,8 @@ class BigqueryClient(object):
     if reference_type == ApiClientHelper.JobReference:
       formatter.AddColumns(
           ('jobId', 'Job Type', 'State', 'Start Time', 'Duration'))
+      if print_format == 'show':
+        formatter.AddColumns(('Bytes Processed',))
     elif reference_type == ApiClientHelper.ProjectReference:
       formatter.AddColumns(
           ('projectId', 'friendlyName'))
@@ -639,6 +646,11 @@ class BigqueryClient(object):
     raise BigqueryError.Create(error, result)
 
   @staticmethod
+  def IsFailedJob(job):
+    """Predicate to determine whether or not a job failed."""
+    return 'errorResult' in job.get('status', {})
+
+  @staticmethod
   def RaiseIfJobError(job):
     """Raises a BigQueryError if the job is in an error state.
 
@@ -652,7 +664,7 @@ class BigqueryClient(object):
       BigqueryError: A BigqueryError instance based on the job's error
       description.
     """
-    if 'errorResult' in job.get('status', {}):
+    if BigqueryClient.IsFailedJob(job):
       error = job['status']['errorResult']
       raise BigqueryError.Create(error, error)
     return job
@@ -756,6 +768,8 @@ class BigqueryClient(object):
         result['State'] = 'SUCCESS'
       except BigqueryError:
         result['State'] = 'FAILURE'
+    if 'totalBytesProcessed' in result.get('statistics', {}):
+      result['Bytes Processed'] = result['statistics']['totalBytesProcessed']
     return result
 
   @staticmethod
@@ -841,30 +855,47 @@ class BigqueryClient(object):
     lower_camel = typename[0].lower() + typename[1:]
     return {lower_camel: dict(reference)}
 
-  def ListJobs(self, reference):
+  def PrepareListRequest(self, reference, max_results=None, page_token=None):
+    request = dict(reference)
+    if max_results is not None:
+      request['maxResults'] = max_results
+    if page_token is not None:
+      request['pageToken'] = page_token
+    return request
+
+  def ListJobs(self, reference,
+               max_results=None, page_token=None, state_filter=None):
     """Return a list of jobs."""
     _Typecheck(reference, ApiClientHelper.ProjectReference, method='ListJobs')
-    request = dict(reference)
+    request = self.PrepareListRequest(reference, max_results, page_token)
     request['projection'] = 'full'
-    jobs = self.apiclient.jobs().list(**dict(request)).execute()
+    if state_filter is not None:
+      # The apiclient wants enum values as lowercase strings.
+      # TODO(user): Iterate over the state_filter argument once
+      # apiclient supports that.
+      request['stateFilter'] = state_filter.lower()
+    jobs = self.apiclient.jobs().list(**request).execute()
     return jobs.get('jobs', [])
 
-  def ListProjects(self):
+  def ListProjects(self, max_results=None, page_token=None):
     """List the projects associated with this account."""
-    result = self.apiclient.projects().list().execute()
+    request = self.PrepareListRequest({}, max_results, page_token)
+    result = self.apiclient.projects().list(**request).execute()
     return result.get('projects', [])
 
-  def ListDatasets(self, reference):
+  def ListDatasets(self, reference, max_results=None, page_token=None):
     """List the datasets associated with this reference."""
     _Typecheck(reference, ApiClientHelper.ProjectReference,
                method='ListDatasets')
-    result = self.apiclient.datasets().list(**dict(reference)).execute()
+    request = self.PrepareListRequest(reference, max_results, page_token)
+    result = self.apiclient.datasets().list(**request).execute()
     return result.get('datasets', [])
 
-  def ListTables(self, reference):
+  def ListTables(self, reference, max_results=None, page_token=None):
     """List the tables associated with this reference."""
     _Typecheck(reference, ApiClientHelper.DatasetReference, method='ListTables')
-    result = self.apiclient.tables().list(**dict(reference)).execute()
+    request = self.PrepareListRequest(reference, max_results, page_token)
+    result = self.apiclient.tables().list(**request).execute()
     return result.get('tables', [])
 
   def CopyTable(self, source_reference, dest_reference):
