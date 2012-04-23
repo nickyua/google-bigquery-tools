@@ -52,6 +52,9 @@ class BigqueryClientTest(googletest.TestCase):
     args = dict(itertools.izip(self.field_names, parts))
     return reference_type(**args)
 
+  def testToCamel(self):
+    self.assertEqual('lowerCamel', bigquery_client._ToLowerCamel('lower_camel'))
+
   def testReadSchemaFromFile(self):
     # Test the filename case.
     with tempfile.NamedTemporaryFile() as f:

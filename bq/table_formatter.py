@@ -72,12 +72,8 @@ overriding the following methods:
 import cStringIO
 import csv
 import itertools
+import json
 import sys
-
-
-from oauth2client import anyjson
-
-json = anyjson.simplejson
 
 
 class FormatterException(Exception):

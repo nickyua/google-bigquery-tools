@@ -7,12 +7,11 @@
 
 import datetime
 import itertools
+import json
 import logging
 import os
 import re
-import shutil
 import sys
-import tempfile
 import time
 
 
@@ -21,9 +20,6 @@ from apiclient import discovery
 from apiclient import http as http_request
 from apiclient import model
 import httplib2
-from oauth2client import anyjson
-
-json = anyjson.simplejson
 
 
 def _Typecheck(obj, types, message=None, method=None):
@@ -34,6 +30,11 @@ def _Typecheck(obj, types, message=None, method=None):
       else:
         message = 'Type of %r is not one of %s' % (obj, types)
     raise TypeError(message)
+
+
+def _ToLowerCamel(name):
+  """Convert a name with underscores to camelcase."""
+  return re.sub('_[a-z]', lambda match: match.group(0)[1].upper(), name)
 
 
 class BigqueryError(Exception):
@@ -64,11 +65,6 @@ class BigqueryError(Exception):
       return BigqueryTermsOfServiceError(message)
     # We map the less interesting errors to BigqueryServiceError.
     return BigqueryServiceError(message)
-
-
-class BigquerySchemaError(BigqueryError):
-  """Error in locating or parsing the schema."""
-  pass
 
 
 class BigqueryCommunicationError(BigqueryError):
@@ -114,6 +110,16 @@ class BigqueryTermsOfServiceError(BigqueryAccessDeniedError):
   pass
 
 
+class BigqueryClientError(BigqueryError):
+  """Invalid use of BigqueryClient."""
+  pass
+
+
+class BigquerySchemaError(BigqueryClientError):
+  """Error in locating or parsing the schema."""
+  pass
+
+
 class BigqueryModel(model.JsonModel):
   """Adds optional global parameters to all requests."""
 
@@ -128,6 +134,7 @@ class BigqueryModel(model.JsonModel):
       query_params['trace'] = self.trace
     return super(BigqueryModel, self).request(
         headers, path_params, query_params, body_value)
+  # pylint:enable-msg=C6409
 
 
 class BigqueryHttp(http_request.HttpRequest):
@@ -144,8 +151,7 @@ class BigqueryHttp(http_request.HttpRequest):
       return BigqueryHttp(captured_model, *args, **kwds)
     return _Construct
 
-  # pylint:disable-msg=C6409
-  def execute(self, **kwds):
+  def execute(self, **kwds):  # pylint:disable-msg=C6409
     try:
       return super(BigqueryHttp, self).execute(**kwds)
     except apiclient.errors.HttpError, e:
@@ -164,6 +170,28 @@ class BigqueryClient(object):
   """Class encapsulating interaction with the BigQuery service."""
 
   def __init__(self, **kwds):
+    """Initializes BigqueryClient.
+
+    Required keywords:
+      api: the api to connect to, for example "bigquery".
+      api_version: the version of the api to connect to, for example "v2".
+
+    Optional keywords:
+      project_id: a default project id to use.
+      dataset_id: a default dataset id to use.
+      discovery_document: the discovery document to use. If not
+        specified, one will be retrieved from the discovery api.
+      job_property: a list of "key=value" strings defining properties
+        to apply to all job operations.
+      trace: a tracing header to inclue in all bigquery api requests.
+      sync: boolean, when inserting jobs, whether to wait for them to
+        complete before returning from the insert request.
+      wait_printer_factory: a function that returns a WaitPrinter.
+        This will be called for each job that we wait on. See WaitJob().
+
+    Raises:
+      ValueError: if keywords are missing or incorrectly specified.
+    """
     super(BigqueryClient, self).__init__()
     for key, value in kwds.iteritems():
       setattr(self, key, value)
@@ -177,6 +205,8 @@ class BigqueryClient(object):
         'discovery_document': None,
         'job_property': '',
         'trace': None,
+        'sync': False,
+        'wait_printer_factory': BigqueryClient.TransitionWaitPrinter,
         }
     for flagname, default in default_flag_values.iteritems():
       if not hasattr(self, flagname):
@@ -200,14 +230,24 @@ class BigqueryClient(object):
               discoveryServiceUrl=discovery_url,
               model=bigquery_model,
               requestBuilder=bigquery_http)
-        except httplib2.ServerNotFoundError, e:
-          raise BigqueryCommunicationError(str(e))
+        except (httplib2.ServerNotFoundError, apiclient.errors.HttpError), e:
+          # We can't find the specified server.
+          raise BigqueryCommunicationError(
+              'Cannot contact server. Please try again. Error: %s' % (str(e),))
+        except apiclient.errors.UnknownApiNameOrVersion, e:
+          # We can't resolve the discovery_url for the given server.
+          raise BigqueryCommunicationError(
+              'Invalid API name or version: %s' % (str(e),))
       else:
         self._apiclient = discovery.build_from_document(
             self.discovery_document, self.api, http=http,
             model=bigquery_model,
             requestBuilder=bigquery_http)
     return self._apiclient
+
+  #################################
+  ## Utility methods
+  #################################
 
   @staticmethod
   def FormatTime(secs):
@@ -318,7 +358,7 @@ class BigqueryClient(object):
         return ApiClientHelper.ProjectReference.Create(projectId=project_id)
     except ValueError:
       pass
-    raise BigqueryError('Cannot determine project described by %s' % (
+    raise BigqueryClientError('Cannot determine project described by %s' % (
         identifier,))
 
   def GetDatasetReference(self, identifier=''):
@@ -391,159 +431,16 @@ class BigqueryClient(object):
       pass
     raise BigqueryError('Cannot determine reference for "%s"' % (identifier,))
 
-  @staticmethod
-  def _SymlinkOrCopy(upload_file, temp_dir):
-    temp_upload_file = os.path.join(temp_dir, 'data.bin')
-    if os.name == 'posix':
-      # On Unix, just symlink the file.
-      os.symlink(os.path.realpath(upload_file), temp_upload_file)
-    else:
-      # Since Python doesn't support Windows symlinks, we copy the file, but
-      # warn the user if the file is large.
-      size = os.stat(upload_file).st_size / (1024 * 1024)
-      if size > 10:
-        print 'To complete this operation, the BigQuery CLI needs to create a'
-        print 'temporary file that is %d MB in size.' % (size,)
-        print
-        response = None
-        while response not in ['y', 'n', '']:
-          response = raw_input('Proceed? (Y/n) ').lower()
-        if response == 'n':
-          raise BigqueryError('Operation cancelled by user.')
-      shutil.copy(upload_file, temp_upload_file)
-    return temp_upload_file
-
-  def StartJob(self, configuration, project_id=None, upload_file=None):
-    """Start a job with the given configuration."""
-    project_id = project_id or self.project_id
-    if not project_id:
-      raise ValueError(
-          'Cannot start a job without a project id. Try '
-          'running "bq init".')
-    configuration = configuration.copy()
-    if self.job_property:
-      configuration['properties'] = dict(
-          prop.partition('=')[0::2] for prop in self.job_property)
-    job_request = {'configuration': configuration}
+  def GetJobReference(self, identifier=''):
+    """Determine a JobReference from an identifier and self."""
+    project_id, job_id = BigqueryClient._ParseIdentifier(identifier)
     try:
-      temp_dir = None
-      temp_upload_file = None
-
-      if upload_file:
-        # The API client determines the MIME type from the file suffix.
-        # Since uploads must have MIME type application/octet-stream
-        # (for now), we symlink (or copy, on Windows) the input file to
-        # a temporary file with the appropriate suffix.
-        # TODO(user): Remove all tempfile nonsense once the API
-        # client allows us to specify the MIME type.
-        temp_dir = tempfile.mkdtemp()
-        temp_upload_file = self._SymlinkOrCopy(upload_file, temp_dir)
-
-      # TODO(user): Figure out a way to show upload progress.
-      result = self.apiclient.jobs().insert(
-          body=job_request, media_body=temp_upload_file,
-          projectId=project_id).execute()
-    finally:
-      if temp_upload_file:
-        os.remove(temp_upload_file)
-      if temp_dir:
-        os.rmdir(temp_dir)
-    return result
-
-  def RunJobSynchronously(self, configuration, project_id=None,
-                          upload_file=None):
-    result = self.StartJob(configuration, project_id=project_id,
-                           upload_file=upload_file)
-    job_reference = BigqueryClient.ConstructObjectReference(result)
-    result = self.WaitJob(job_reference)
-    return self.RaiseIfJobError(result)
-
-  def WaitJob(self, job_reference, status='DONE',
-              wait=sys.maxint, print_status=True):
-    """Poll for a job to run until it reaches the requested status.
-
-    Arguments:
-      job_reference: JobReference to poll.
-      status: (optional, default 'DONE') Desired job status.
-      wait: (optional, default maxint) Max wait time.
-      print_status: (optional, default True) If True, print status
-        and wait time as the job executes.
-
-    Returns:
-      The job object returned by the final status call.
-
-    Raises:
-      StopIteration: If polling does not reach the desired state before
-        timing out.
-      ValueError: If given an invalid wait value.
-    """
-
-    def PrintStatus(job_id, current_wait, status):
-      printed = False
-      if print_status:
-        print '\rWaiting on %s ... (%ds) Current status: %-7s' % (
-            job_id, current_wait, status),
-        printed = True
-        sys.stdout.flush()
-      return printed
-
-    _Typecheck(job_reference, ApiClientHelper.JobReference, method='WaitJob')
-    # TODO(user): Change the defaults for this function.
-    current = 'UNKNOWN'
-    start_time = time.time()
-    job = None
-    print_status = print_status and not self.quiet
-
-    # This is a first pass at wait logic: we ping at 1s intervals a few
-    # times, then increase to max(3, max_wait), and then keep waiting
-    # that long until we've run out of time.
-    waits = itertools.chain(
-        itertools.repeat(1, 8),
-        xrange(2, 30, 3),
-        itertools.repeat(30))
-    current_wait = 0
-    while current_wait <= wait:
-      try:
-        done, job = self.PollJob(job_reference, status=status, wait=wait)
-        if done:
-          PrintStatus(job_reference.jobId, current_wait, job['status']['state'])
-          break
-      except BigqueryCommunicationError, e:
-        # Communication errors while waiting on a job are okay.
-        logging.warning('Transient error during job status check: %s', e)
-      for _ in xrange(waits.next()):
-        current_wait = time.time() - start_time
-        PrintStatus(job_reference.jobId, current_wait, job['status']['state'])
-        time.sleep(1)
-    else:
-      raise StopIteration(
-          'Wait timed out. Operation not finished, in state %s' % (current,))
-    if print_status and wait:
-      print
-    return job
-
-  def PollJob(self, job_reference, status='DONE', wait=0):
-    """Poll a job once for a specific status.
-
-    Arguments:
-      job_reference: JobReference to poll.
-      status: (optional, default 'DONE') Desired job status.
-      wait: (optional, default 0) Max server-side wait time for one poll call.
-
-    Returns:
-      Tuple (in_state, job) where in_state is True if job is
-      in the desired state.
-
-    Raises:
-      ValueError: If given an invalid wait value.
-    """
-    _Typecheck(job_reference, ApiClientHelper.JobReference, method='PollJob')
-    wait = BigqueryClient.NormalizeWait(wait)
-    # TODO(user): Wire in wait once the server supports wait
-    # timeouts on get requests.
-    job = self.apiclient.jobs().get(**dict(job_reference)).execute()
-    current = job['status']['state']
-    return (current == status, job)
+      return ApiClientHelper.JobReference.Create(
+          projectId=project_id or self.project_id,
+          jobId=job_id)
+    except ValueError:
+      raise BigqueryError('Cannot determine job described by %s' % (
+          identifier,))
 
   def GetObjectInfo(self, reference):
     """Get all data returned by the server about a specific object."""
@@ -620,21 +517,27 @@ class BigqueryClient(object):
     """
     BigqueryClient.ValidatePrintFormat(print_format)
     if reference_type == ApiClientHelper.JobReference:
+      if print_format == 'list':
+        formatter.AddColumns(('jobId',))
       formatter.AddColumns(
-          ('jobId', 'Job Type', 'State', 'Start Time', 'Duration'))
+          ('Job Type', 'State', 'Start Time', 'Duration',))
       if print_format == 'show':
         formatter.AddColumns(('Bytes Processed',))
     elif reference_type == ApiClientHelper.ProjectReference:
-      formatter.AddColumns(
-          ('projectId', 'friendlyName'))
+      if print_format == 'list':
+        formatter.AddColumns(('projectId',))
+      formatter.AddColumns(('friendlyName',))
     elif reference_type == ApiClientHelper.DatasetReference:
-      formatter.AddColumns(('datasetId',))
+      if print_format == 'list':
+        formatter.AddColumns(('datasetId',))
       if print_format == 'show':
-        formatter.AddColumns(('Last modified', 'ACLs'))
+        formatter.AddColumns(('Last modified', 'ACLs',))
     elif reference_type == ApiClientHelper.TableReference:
-      formatter.AddColumns(('tableId',))
+      if print_format == 'list':
+        formatter.AddColumns(('tableId',))
       if print_format == 'show':
-        formatter.AddColumns(('Last modified', 'Schema'))
+        formatter.AddColumns(('Last modified', 'Schema',
+                              'Total Rows', 'Total Bytes',))
     else:
       raise ValueError('Unknown reference type: %s' % (
           reference_type.__name__,))
@@ -678,6 +581,42 @@ class BigqueryClient(object):
           job_names).pop()
     except KeyError:
       return None
+
+  @staticmethod
+  def ProcessSources(source_string):
+    """Take a source string and return a list of URIs.
+
+    The list will consist of either a single local filename, which
+    we check exists and is a file, or a list of gs:// uris.
+
+    Args:
+      source_string: A comma-separated list of URIs.
+
+    Returns:
+      List of one or more valid URIs, as strings.
+
+    Raises:
+      BigqueryClientError: if no valid list of sources can be determined.
+    """
+    sources = [source.strip() for source in source_string.split(',')]
+    gs_uris = [source for source in sources if source.startswith('gs://')]
+    if not sources:
+      raise BigqueryClientError('No sources specified')
+    if gs_uris:
+      if len(gs_uris) != len(sources):
+        raise BigqueryClientError('All URIs must begin with "gs://" if any do.')
+      return sources
+    else:
+      source = sources[0]
+      if len(sources) > 1:
+        raise BigqueryClientError(
+            'Local upload currently supports only one file, found %d' % (
+                len(sources),))
+      if not os.path.exists(source):
+        raise BigqueryClientError('Source file not found: %s' % (source,))
+      if not os.path.isfile(source):
+        raise BigqueryClientError('Source path is not a file: %s' % (source,))
+    return sources
 
   @staticmethod
   def ReadSchema(schema):
@@ -825,6 +764,10 @@ class BigqueryClient(object):
           int(result['lastModifiedTime']) / 1000)
     if 'schema' in result:
       result['Schema'] = BigqueryClient.FormatSchema(result['schema'])
+    if 'numBytes' in result:
+      result['Total Bytes'] = result['numBytes']
+    if 'numRows' in result:
+      result['Total Rows'] = result['numRows']
     return result
 
   @staticmethod
@@ -855,7 +798,7 @@ class BigqueryClient(object):
     lower_camel = typename[0].lower() + typename[1:]
     return {lower_camel: dict(reference)}
 
-  def PrepareListRequest(self, reference, max_results=None, page_token=None):
+  def _PrepareListRequest(self, reference, max_results=None, page_token=None):
     request = dict(reference)
     if max_results is not None:
       request['maxResults'] = max_results
@@ -863,11 +806,25 @@ class BigqueryClient(object):
       request['pageToken'] = page_token
     return request
 
-  def ListJobs(self, reference,
+  def _NormalizeProjectReference(self, reference):
+    if reference is None:
+      try:
+        return self.GetProjectReference()
+      except BigqueryClientError:
+        raise BigqueryClientError(
+            'Project reference or a default project is required')
+    return reference
+
+  def ListJobRefs(self, **kwds):
+    return map(  # pylint:disable-msg=C6402
+        BigqueryClient.ConstructObjectReference, self.ListJobs(**kwds))
+
+  def ListJobs(self, reference=None,
                max_results=None, page_token=None, state_filter=None):
     """Return a list of jobs."""
+    reference = self._NormalizeProjectReference(reference)
     _Typecheck(reference, ApiClientHelper.ProjectReference, method='ListJobs')
-    request = self.PrepareListRequest(reference, max_results, page_token)
+    request = self._PrepareListRequest(reference, max_results, page_token)
     request['projection'] = 'full'
     if state_filter is not None:
       # The apiclient wants enum values as lowercase strings.
@@ -877,43 +834,79 @@ class BigqueryClient(object):
     jobs = self.apiclient.jobs().list(**request).execute()
     return jobs.get('jobs', [])
 
+  def ListProjectRefs(self, **kwds):
+    return map(  # pylint:disable-msg=C6402
+        BigqueryClient.ConstructObjectReference, self.ListProjects(**kwds))
+
   def ListProjects(self, max_results=None, page_token=None):
     """List the projects associated with this account."""
-    request = self.PrepareListRequest({}, max_results, page_token)
+    request = self._PrepareListRequest({}, max_results, page_token)
     result = self.apiclient.projects().list(**request).execute()
     return result.get('projects', [])
 
-  def ListDatasets(self, reference, max_results=None, page_token=None):
+  def ListDatasetRefs(self, **kwds):
+    return map(  # pylint:disable-msg=C6402
+        BigqueryClient.ConstructObjectReference, self.ListDatasets(**kwds))
+
+  def ListDatasets(self, reference=None, max_results=None, page_token=None):
     """List the datasets associated with this reference."""
+    reference = self._NormalizeProjectReference(reference)
     _Typecheck(reference, ApiClientHelper.ProjectReference,
                method='ListDatasets')
-    request = self.PrepareListRequest(reference, max_results, page_token)
+    request = self._PrepareListRequest(reference, max_results, page_token)
     result = self.apiclient.datasets().list(**request).execute()
     return result.get('datasets', [])
+
+  def ListTableRefs(self, **kwds):
+    return map(  # pylint:disable-msg=C6402
+        BigqueryClient.ConstructObjectReference, self.ListTables(**kwds))
 
   def ListTables(self, reference, max_results=None, page_token=None):
     """List the tables associated with this reference."""
     _Typecheck(reference, ApiClientHelper.DatasetReference, method='ListTables')
-    request = self.PrepareListRequest(reference, max_results, page_token)
+    request = self._PrepareListRequest(reference, max_results, page_token)
     result = self.apiclient.tables().list(**request).execute()
     return result.get('tables', [])
 
-  def CopyTable(self, source_reference, dest_reference):
-    """Copies a table."""
+  #################################
+  ## Table and dataset management
+  #################################
+
+  def CopyTable(self, source_reference, dest_reference,
+                write_disposition=None, ignore_already_exists=False):
+    """Copies a table.
+
+    Args:
+      source_reference: TableReference of source table.
+      dest_reference: TableReference of destination table.
+      write_disposition: Optional, one of 'WRITE_EMPTY' or
+        'WRITE_TRUNCATE' or 'WRITE_APPEND'. If not specified, the
+        copy api default will be used.
+      ignore_already_exists: Whether to ignore "already exists" errors.
+
+    Returns:
+      The job description, or None for ignored errors.
+
+    Raises:
+      BigqueryDuplicateError: when write_disposition 'WRITE_EMPTY' is
+        specified and the dest_reference table already exists.
+    """
     _Typecheck(source_reference, ApiClientHelper.TableReference,
                method='CopyTable')
     _Typecheck(dest_reference, ApiClientHelper.TableReference,
                method='CopyTable')
-    keywords = {
-        'sourceProjectId': source_reference.projectId,
-        'sourceDatasetId': source_reference.datasetId,
-        'sourceTableId': source_reference.tableId
+    copy_config = {
+        'destinationTable': dict(dest_reference),
+        'sourceTable': dict(source_reference),
         }
-    request = {
-        'destinationTable': dict(dest_reference)
-        }
-    self.apiclient.tables().copy(body=request,
-                                 **keywords).execute()
+    if write_disposition:
+      copy_config['writeDisposition'] = write_disposition
+    try:
+      return self.ExecuteJob({'copy': copy_config})
+    except BigqueryDuplicateError, e:
+      if ignore_already_exists:
+        return None
+      raise e
 
   def DatasetExists(self, reference):
     _Typecheck(reference, ApiClientHelper.DatasetReference,
@@ -943,7 +936,7 @@ class BigqueryClient(object):
     Raises:
       TypeError: if reference is not a DatasetReference.
       BigqueryDuplicateError: if reference exists and ignore_existing
-        is False.
+         is False.
     """
     _Typecheck(reference, ApiClientHelper.DatasetReference,
                method='CreateDataset')
@@ -1031,6 +1024,266 @@ class BigqueryClient(object):
       if not ignore_not_found:
         raise
 
+  #################################
+  ## Job control
+  #################################
+
+  def StartJob(self, configuration, project_id=None, upload_file=None):
+    """Start a job with the given configuration."""
+    project_id = project_id or self.project_id
+    if not project_id:
+      raise ValueError(
+          'Cannot start a job without a project id. Try '
+          'running "bq init".')
+    configuration = configuration.copy()
+    if self.job_property:
+      configuration['properties'] = dict(
+          prop.partition('=')[0::2] for prop in self.job_property)
+    job_request = {'configuration': configuration}
+    media_upload = None
+    if upload_file:
+      media_upload = http_request.MediaFileUpload(
+          filename=upload_file, mimetype='application/octet-stream',
+          resumable=True)
+    result = self.apiclient.jobs().insert(
+        body=job_request, media_body=media_upload,
+        projectId=project_id).execute()
+    return result
+
+  def RunJobSynchronously(self, configuration, project_id=None,
+                          upload_file=None):
+    result = self.StartJob(configuration, project_id=project_id,
+                           upload_file=upload_file)
+    job_reference = BigqueryClient.ConstructObjectReference(result)
+    result = self.WaitJob(job_reference)
+    return self.RaiseIfJobError(result)
+
+  def ExecuteJob(self, configuration, sync=None, upload_file=None):
+    """Execute a job, possibly waiting for results."""
+    if sync is None:
+      sync = self.sync
+
+    if sync:
+      job = self.RunJobSynchronously(configuration, upload_file=upload_file)
+    else:
+      job = self.StartJob(configuration, upload_file=upload_file)
+      self.RaiseIfJobError(job)
+    return job
+
+  class WaitPrinter(object):
+    """Base class that defines the WaitPrinter interface."""
+
+    def Print(self, job_id, wait_time, status):
+      """Prints status for the current job we are waiting on.
+
+      Args:
+        job_id: the identifier for this job.
+        wait_time: the number of seconds we have been waiting so far.
+        status: the status of the job we are waiting for.
+      """
+      raise NotImplementedError('Subclass must implement Print')
+
+    def Done(self):
+      """Waiting is done and no more Print calls will be made.
+
+      This function should handle the case of Print not being called.
+      """
+      raise NotImplementedError('Subclass must implement Done')
+
+  class WaitPrinterHelper(WaitPrinter):
+    """A Done implementation that prints based off a property."""
+
+    print_on_done = False
+
+    def Done(self):
+      if self.print_on_done:
+        print
+
+  class QuietWaitPrinter(WaitPrinterHelper):
+    """A WaitPrinter that prints nothing."""
+
+    def Print(self, unused_job_id, unused_wait_time, unused_status):
+      pass
+
+  class VerboseWaitPrinter(WaitPrinterHelper):
+    """A WaitPrinter that prints every update."""
+
+    def Print(self, job_id, wait_time, status):
+      self.print_on_done = True
+      print '\rWaiting on %s ... (%ds) Current status: %-7s' % (
+          job_id, wait_time, status),
+      sys.stdout.flush()
+
+  class TransitionWaitPrinter(VerboseWaitPrinter):
+    """A WaitPrinter that only prints status change updates."""
+
+    _previous_status = None
+
+    def Print(self, job_id, wait_time, status):
+      if status != self._previous_status:
+        self._previous_status = status
+        super(BigqueryClient.TransitionWaitPrinter, self).Print(
+            job_id, wait_time, status)
+
+  def WaitJob(self, job_reference, status='DONE',
+              wait=sys.maxint, wait_printer_factory=None):
+    """Poll for a job to run until it reaches the requested status.
+
+    Arguments:
+      job_reference: JobReference to poll.
+      status: (optional, default 'DONE') Desired job status.
+      wait: (optional, default maxint) Max wait time.
+      wait_printer_factory: (optional, defaults to
+        self.wait_printer_factory) Returns a subclass of WaitPrinter
+        that will be called after each job poll.
+
+    Returns:
+      The job object returned by the final status call.
+
+    Raises:
+      StopIteration: If polling does not reach the desired state before
+        timing out.
+      ValueError: If given an invalid wait value.
+    """
+    _Typecheck(job_reference, ApiClientHelper.JobReference, method='WaitJob')
+    start_time = time.time()
+    job = None
+    if wait_printer_factory:
+      printer = wait_printer_factory()
+    else:
+      printer = self.wait_printer_factory()
+
+    # This is a first pass at wait logic: we ping at 1s intervals a few
+    # times, then increase to max(3, max_wait), and then keep waiting
+    # that long until we've run out of time.
+    waits = itertools.chain(
+        itertools.repeat(1, 8),
+        xrange(2, 30, 3),
+        itertools.repeat(30))
+    current_wait = 0
+    current_status = 'UNKNOWN'
+    while current_wait <= wait:
+      try:
+        done, job = self.PollJob(job_reference, status=status, wait=wait)
+        current_status = job['status']['state']
+        if done:
+          printer.Print(job_reference.jobId, current_wait, current_status)
+          break
+      except BigqueryCommunicationError, e:
+        # Communication errors while waiting on a job are okay.
+        logging.warning('Transient error during job status check: %s', e)
+      for _ in xrange(waits.next()):
+        current_wait = time.time() - start_time
+        printer.Print(job_reference.jobId, current_wait, current_status)
+        time.sleep(1)
+    else:
+      raise StopIteration(
+          'Wait timed out. Operation not finished, in state %s' % (
+              current_status,))
+    printer.Done()
+    return job
+
+  def PollJob(self, job_reference, status='DONE', wait=0):
+    """Poll a job once for a specific status.
+
+    Arguments:
+      job_reference: JobReference to poll.
+      status: (optional, default 'DONE') Desired job status.
+      wait: (optional, default 0) Max server-side wait time for one poll call.
+
+    Returns:
+      Tuple (in_state, job) where in_state is True if job is
+      in the desired state.
+
+    Raises:
+      ValueError: If given an invalid wait value.
+    """
+    _Typecheck(job_reference, ApiClientHelper.JobReference, method='PollJob')
+    wait = BigqueryClient.NormalizeWait(wait)
+    job = self.apiclient.jobs().get(**dict(job_reference)).execute()
+    current = job['status']['state']
+    return (current == status, job)
+
+  #################################
+  ## Wrappers for job types
+  #################################
+
+  def RunQuery(self, **kwds):
+    """Run a query job synchronously, and return the result.
+
+    Args:
+      **kwds: Passed on to self.Query and self.ExecuteJob.
+
+    Returns:
+      The rows in the query result as a list.
+    """
+    new_kwds = dict(kwds)
+    new_kwds['sync'] = True
+    job = self.Query(**new_kwds)
+    return self.ReadTableRows(job['configuration']['query']['destinationTable'])
+
+  def Query(self, query, destination_table=None, **kwds):
+    """Execute the given query, returning the created job.
+
+    The job will execute synchronously sync=True is provided as an argument
+    or if self.sync is true.
+
+    Args:
+      query: Query to execute.
+      destination_table: (default None) If provided, send the results to the
+          given table.
+      **kwds: Passed on to self.ExecuteJob.
+
+    Raises:
+      BigqueryInvalidQueryError: if no query is provided.
+
+    Returns:
+      The resulting job info.
+    """
+    if not query:
+      raise BigqueryInvalidQueryError('No query string provided')
+    query_config = {'query': query}
+    if self.dataset_id:
+      query_config['defaultDataset'] = dict(self.GetDatasetReference())
+    if destination_table:
+      try:
+        reference = self.GetTableReference(destination_table)
+      except BigqueryError, e:
+        raise BigqueryError('Invalid value %s for destination_table: %s' % (
+            destination_table, e))
+      query_config['destinationTable'] = dict(reference)
+    return self.ExecuteJob({'query': query_config}, **kwds)
+
+  def Load(self, destination_table_reference, source, schema=None, **kwds):
+    """Load the given data into BigQuery.
+
+    The job will execute synchronously sync=True is provided as an argument
+    or if self.sync is true.
+
+    Args:
+      destination_table_reference: TableReference to load data into.
+      source: String specifying source data to load.
+      schema: (default None) Schema of the created table. (Can be left blank
+          for append operations.)
+      **kwds: Passed on to self.ExecuteJob.
+
+    Returns:
+      The resulting job info.
+    """
+    _Typecheck(destination_table_reference, ApiClientHelper.TableReference)
+    load_config = {'destinationTable': dict(destination_table_reference)}
+    sources = BigqueryClient.ProcessSources(source)
+    if sources[0].startswith('gs://'):
+      load_config['sourceUris'] = sources
+      upload_file = None
+    else:
+      upload_file = sources[0]
+    if schema is not None:
+      load_config['schema'] = {'fields': BigqueryClient.ReadSchema(schema)}
+    load_config.update((_ToLowerCamel(k), v) for k, v in kwds.iteritems() if v)
+    return self.ExecuteJob(configuration={'load': load_config},
+                           upload_file=upload_file)
+
 
 class ApiClientHelper(object):
   """Static helper methods and classes not provided by the discovery client."""
@@ -1076,7 +1329,7 @@ class ApiClientHelper(object):
 
   class JobReference(Reference):
     _required_fields = set(('projectId', 'jobId'))
-    _format_str = '%(jobId)s'
+    _format_str = '%(projectId)s:%(jobId)s'
     typename = 'job'
 
   class ProjectReference(Reference):

@@ -87,6 +87,13 @@ flags.DEFINE_boolean(
     'quiet', False,
     'If True, ignore status updates while jobs are running.',
     short_name='q')
+flags.DEFINE_boolean(
+    'headless',
+    False,
+    'Whether this bq session is running without user interaction. This '
+    'affects behavior that expect user interaction, like whether '
+    'debug_mode will break into the debugger and lowers the frequency '
+    'of informational printing.')
 flags.DEFINE_enum(
     'format', None,
     ['none', 'json', 'prettyjson', 'csv', 'sparse', 'pretty'],
@@ -153,6 +160,8 @@ def _SetupLoggerFromFlags():
   if FLAGS['apilog'].present:
     if FLAGS.apilog in ('', '-', '1', 'true', 'stdout'):
       logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    elif FLAGS.apilog == 'stderr':
+      logging.basicConfig(stream=sys.stderr, level=logging.INFO)
     elif FLAGS.apilog:
       logging.basicConfig(filename=FLAGS.apilog, level=logging.INFO)
     else:
@@ -238,18 +247,29 @@ def _GetCredentialsFromFlags():
     raise bigquery_client.BigqueryError(
         'Error setting permissions on %s: %s' % (FLAGS.credential_file, e))
   storage = oauth2client.file.Storage(FLAGS.credential_file)
-  credentials = storage.get()
+  try:
+    credentials = storage.get()
+  except BaseException, e:
+    BigqueryCmd.ProcessError(
+        e, name='GetCredentialsFromFlags',
+        message_prefix=(
+            'Credentials appear corrupt. Please delete the credential file '
+            'and try your command again. You can delete your credential '
+            'file using "bq delete_credentials".\n\nIf that does not work, '
+            'you may have encountered a bug in the BigQuery CLI.'))
+    sys.exit(1)
 
   # TODO(user): Catch errors here and send the user to a
   # place to get more information (wiki?).
-  # TODO(user): Detect the case of not being at a tty and
-  # handle appropriately. os.isatty is not sufficient (Unix only).
   if credentials is None or credentials.invalid:
     print
     print '******************************************************************'
     print '** No OAuth2 credentials found, beginning authorization process **'
     print '******************************************************************'
     print
+    if FLAGS.headless:
+      print 'Running in headless mode, exiting.'
+      sys.exit(1)
     while True:
       # If authorization fails, we want to retry, rather than let this
       # cascade up and get caught elsewhere. If users want out of the
@@ -287,27 +307,64 @@ def _PrintTable(client, table_dict, **extra_args):
   formatter.Print()
 
 
+def _GetWaitPrinterFactoryFromFlags():
+  """Returns the default wait_printer_factory to use while waiting for jobs."""
+  if FLAGS.quiet:
+    return BigqueryClient.QuietWaitPrinter
+  if FLAGS.headless:
+    return BigqueryClient.TransitionWaitPrinter
+  return BigqueryClient.VerboseWaitPrinter
+
+
+def _PromptWithDefault(message):
+  """Prompts user with message, return key pressed or '' on enter."""
+  if FLAGS.headless:
+    print 'Running --headless, accepting default for prompt: %s' % (message,)
+    return ''
+  return raw_input(message).lower()
+
+
+def _PromptYN(message):
+  """Prompts user with message, returning the key 'y', 'n', or '' on enter."""
+  response = None
+  while response not in ['y', 'n', '']:
+    response = _PromptWithDefault(message)
+  return response
+
+
 class Client(object):
   """Class wrapping a singleton bigquery_client.BigqueryClient."""
   client = None
+
+  @staticmethod
+  def Create(**kwds):
+    """Build a new BigqueryClient configured from kwds and FLAGS."""
+
+    def KwdsOrFlags(name):
+      return kwds[name] if name in kwds else getattr(FLAGS, name)
+
+    # Note that we need to handle possible initialization tasks
+    # for the case of being loaded as a library.
+    _ProcessBigqueryrc()
+    credentials = _GetCredentialsFromFlags()
+    client_args = {}
+    global_args = ('credential_file', 'job_property',
+                   'project_id', 'dataset_id', 'trace', 'sync',
+                   'api', 'api_version')
+    for name in global_args:
+      client_args[name] = KwdsOrFlags(name)
+    client_args['wait_printer_factory'] = _GetWaitPrinterFactoryFromFlags()
+    if FLAGS.discovery_file:
+      with open(FLAGS.discovery_file) as f:
+        client_args['discovery_document'] = f.read()
+    return BigqueryClient(credentials=credentials, **client_args)
 
   @classmethod
   def Get(cls):
     """Return a BigqueryClient initialized from flags."""
     if cls.client is None:
-      discovery_document = None
-      if FLAGS.discovery_file:
-        with open(FLAGS.discovery_file) as f:
-          discovery_document = f.read()
-      client_args = {'discovery_document': discovery_document}
-      global_args = ('credential_file', 'job_property', 'quiet',
-                     'project_id', 'dataset_id', 'trace')
-      for name in global_args:
-        client_args[name] = getattr(FLAGS, name)
-      client_args.update(_ResolveApiInfoFromFlags())
       try:
-        cls.client = BigqueryClient(
-            credentials=_GetCredentialsFromFlags(), **client_args)
+        cls.client = Client.Create()
       except ValueError, e:
         # Convert constructor parameter errors into flag usage errors.
         raise app.UsageError(e)
@@ -437,30 +494,42 @@ class NewCmd(appcommands.Cmd):
     self.Run([self._command_name] + args)
     return False
 
+  def _HandleError(self, e):
+    print 'Exception raised in %s operation: %s' % (self._command_name, e)
+    return 1
+
   def RunDebug(self, args, kwds):
     """Run this command in debug mode."""
     try:
       self.RunWithArgs(*args, **kwds)
       return 0
-    except BaseException:  # pylint:disable-msg=W0703
+    except BaseException, e:
+      if (isinstance(e, bigquery_client.BigqueryError) and
+          not isinstance(e, bigquery_client.BigqueryInterfaceError)):
+        return self._HandleError(e)
       print
-      print '******************************************'
-      print '**   Exception raised in bq execution!  **'
-      print '**  --debug_mode enabled, starting pdb  **'
-      print '******************************************'
+      print '****************************************************'
+      print '**  Unexpected Exception raised in bq execution!  **'
+      if FLAGS.headless:
+        print '**  --headless mode enabled, exiting.             **'
+        print '**  See STDERR for traceback.                     **'
+      else:
+        print '**  --debug_mode enabled, starting pdb.           **'
+      print '****************************************************'
       print
       traceback.print_exc()
       print
-      pdb.post_mortem()
+      if not FLAGS.headless:
+        pdb.post_mortem()
+      return 1
 
   def RunSafely(self, args, kwds):
     """Run this command, turning exceptions into print statements."""
     try:
       self.RunWithArgs(*args, **kwds)
       return 0
-    except BaseException, e:  # pylint:disable-msg=W0703
-      print 'Exception raised in %s operation: %s' % (self._command_name, e)
-      return 1
+    except BaseException, e:
+      return self._HandleError(e)
 
 
 class BigqueryCmd(NewCmd):
@@ -483,16 +552,18 @@ class BigqueryCmd(NewCmd):
     return unicode(s).encode(encoding, 'backslashreplace')
 
   @staticmethod
-  def ProcessError(e, name='unknown'):
+  def ProcessError(
+      e, name='unknown',
+      message_prefix='You have encountered a bug in the BigQuery CLI.'):
     """Translate an error message into some printing and a return code."""
     response = []
     retcode = 1
 
     contact_us_msg = (
-        'You have encountered a bug in the BigQuery CLI. Please '
-        'send an email to bigquery-team@google.com to report this, '
-        'and include the command you typed as well as the following '
-        'information: \n')
+        '%s%sPlease send an email to bigquery-team@google.com to '
+        'report this, and include the command you typed as well as '
+        'the following information: \n') % (
+            message_prefix, ' ' if message_prefix else '')
 
     codecs.register_error('strict', codecs.replace_errors)
     message = BigqueryCmd.EncodeForPrinting(e)
@@ -529,17 +600,10 @@ class BigqueryCmd(NewCmd):
     print flags.TextWrap('\n'.join(response))
     return retcode
 
-  def ExecuteJob(self, configuration, upload_file=None):
-    """Execute a job, possibly waiting for results."""
-    client = Client.Get()
-    if FLAGS.sync:
-      job = client.RunJobSynchronously(configuration, upload_file=upload_file)
-    else:
-      job = client.StartJob(configuration, upload_file=upload_file)
-      client.RaiseIfJobError(job)
-      reference = BigqueryClient.ConstructObjectReference(job)
-      print 'Successfully started %s %s' % (self._command_name, reference)
-    return job
+  def PrintJobStartInfo(self, job):
+    """Print a simple status line."""
+    reference = BigqueryClient.ConstructObjectReference(job)
+    print 'Successfully started %s %s' % (self._command_name, reference)
 
 
 class _Load(BigqueryCmd):
@@ -615,41 +679,23 @@ class _Load(BigqueryCmd):
         URI paths to data to import.
       schema: Either a text schema or JSON file, as above.
     """
-    table_reference = Client.Get().GetTableReference(destination_table)
-    load_request = {'load': {
-        'createDisposition': 'CREATE_IF_NEEDED',
-        'destinationTable': dict(table_reference),
-        }}
-    upload_file = None
-    if source.startswith('gs://'):
-      source_uris = source.split(',')
-      if any(not source_uri.startswith('gs://') for source_uri in source_uris):
-        raise app.UsageError('All URIs must begin with "gs://".')
-      load_request['load']['sourceUris'] = source_uris
-    else:
-      if not os.path.exists(source):
-        raise app.UsageError('Source file not found: %s' % (source,))
-      if not os.path.isfile(source):
-        raise app.UsageError('Source path is not a file: %s' % (source,))
-      upload_file = source
+    client = Client.Get()
+    table_reference = client.GetTableReference(destination_table)
+    opts = {
+        'encoding': self.encoding,
+        'skip_leading_rows': self.skip_leading_rows,
+        'max_bad_records': self.max_bad_records,
+        }
     if self.replace:
-      load_request['load']['writeDisposition'] = 'WRITE_TRUNCATE'
-    if schema:
-      schema = bigquery_client.BigqueryClient.ReadSchema(schema)
-      load_request['load']['schema'] = {'fields': schema}
+      opts['write_disposition'] = 'WRITE_TRUNCATE'
     if self.field_delimiter:
       key = self.field_delimiter.lower()
-      self.field_delimiter = _DELIMITER_MAP.get(
+      opts['field_delimiter'] = _DELIMITER_MAP.get(
           key, self.field_delimiter)
-      load_request['load']['fieldDelimiter'] = self.field_delimiter
-    if self.encoding:
-      load_request['load']['encoding'] = self.encoding
-    if self.skip_leading_rows:
-      load_request['load']['skipLeadingRows'] = self.skip_leading_rows
-    if self.max_bad_records > 0:
-      load_request['load']['maxBadRecords'] = self.max_bad_records
 
-    self.ExecuteJob(load_request, upload_file)
+    job = client.Load(table_reference, source, schema=schema, **opts)
+    if not FLAGS.sync:
+      self.PrintJobStartInfo(job)
 
 
 class _Query(BigqueryCmd):
@@ -672,25 +718,11 @@ class _Query(BigqueryCmd):
       query <sql_query>
     """
     client = Client.Get()
-    if not args:
-      raise bigquery_client.BigqueryInvalidQueryError(
-          'No query string provided')
-    query_config = {'query': ' '.join(args)}
-    if client.dataset_id:
-      query_config['defaultDataset'] = dict(client.GetDatasetReference())
-    if self.destination_table:
-      try:
-        reference = client.GetTableReference(self.destination_table)
-        query_config['destinationTable'] = dict(reference)
-        query_config['createDisposition'] = 'CREATE_IF_NEEDED'
-      except bigquery_client.BigqueryError, e:
-        raise bigquery_client.BigqueryError(
-            'Invalid value %s for destination_table: %s' % (
-                self.destination_table, e))
-    result = self.ExecuteJob({'query': query_config})
+    job = client.Query(' '.join(args), destination_table=self.destination_table)
     if not FLAGS.sync:
-      return
-    _PrintTable(client, result['configuration']['query']['destinationTable'])
+      self.PrintJobStartInfo(job)
+    else:
+      _PrintTable(client, job['configuration']['query']['destinationTable'])
 
 
 class _Extract(BigqueryCmd):
@@ -709,12 +741,15 @@ class _Extract(BigqueryCmd):
       source_table: Source table to extract.
       destination_uri: Google Storage uri.
     """
-    table_reference = Client.Get().GetTableReference(source_table)
+    client = Client.Get()
+    table_reference = client.GetTableReference(source_table)
     extract_request = {'extract': {
         'destinationUri': destination_uri,
         'sourceTable': dict(table_reference)
         }}
-    self.ExecuteJob(extract_request)
+    job = client.ExecuteJob(extract_request)
+    if not FLAGS.sync:
+      self.PrintJobStartInfo(job)
 
 
 class _List(BigqueryCmd):
@@ -831,7 +866,7 @@ class _Delete(BigqueryCmd):
         short_name='t', flag_values=fv)
     flags.DEFINE_boolean(
         'force', False,
-        "Ignore non-existing files, don't prompt.",
+        "Ignore existing tables and datasets, don't prompt.",
         short_name='f', flag_values=fv)
     flags.DEFINE_boolean(
         'recursive', False,
@@ -877,12 +912,7 @@ class _Delete(BigqueryCmd):
            client.DatasetExists(reference)) or
           (isinstance(reference, TableReference)
            and client.TableExists(reference))):
-        # TODO(user): Replace with common prompt functionality.
-        msg = 'rm: remove %r? (y/N) ' % (reference,)
-        response = None
-        while response not in ['y', 'n', '']:
-          response = raw_input(msg).lower()
-        if response != 'y':
+        if 'y' != _PromptYN('rm: remove %r? (y/N) ' % (reference,)):
           print 'NOT deleting %r, exiting.' % (reference,)
           return 0
 
@@ -896,10 +926,18 @@ class _Delete(BigqueryCmd):
 
 
 class _Copy(BigqueryCmd):
-  usage = """cp <source_table> <dest_table>"""
+  usage = """cp [-n] <source_table> <dest_table>"""
 
   def __init__(self, name, fv):
     super(_Copy, self).__init__(name, fv)
+    flags.DEFINE_boolean(
+        'no_clobber', False,
+        'Do not overwrite an existing table.',
+        short_name='n', flag_values=fv)
+    flags.DEFINE_boolean(
+        'force', False,
+        "Ignore existing destination tables, don't prompt.",
+        short_name='f', flag_values=fv)
 
   def RunWithArgs(self, source_table, dest_table):
     """Copies one table to another.
@@ -908,19 +946,32 @@ class _Copy(BigqueryCmd):
       bq cp dataset.old_table dataset2.new_table
     """
     client = Client.Get()
-
     source_reference = client.GetTableReference(source_table)
     dest_reference = client.GetTableReference(dest_table)
 
-    copy_config = {
-        'sourceTable': dict(source_reference),
-        'destinationTable': dict(dest_reference)
-        }
-    self.ExecuteJob({'copy': copy_config})
-    if not FLAGS.sync:
-      return
-    print "Table '%s' successfully copied to '%s'" % (source_reference,
-                                                      dest_reference)
+    if self.no_clobber:
+      write_disposition = 'WRITE_EMPTY'
+      ignore_already_exists = True
+    else:
+      write_disposition = 'WRITE_TRUNCATE'
+      ignore_already_exists = False
+      if not self.force:
+        if client.TableExists(dest_reference):
+          if 'y' != _PromptYN('cp: replace %r? (y/N) ' % (dest_reference,)):
+            print 'NOT copying %r, exiting.' % (source_reference,)
+            return 0
+
+    job = client.CopyTable(
+        source_reference, dest_reference,
+        write_disposition=write_disposition,
+        ignore_already_exists=ignore_already_exists)
+    if job is None:
+      print "Table '%s' already exists, skipping" % (dest_reference,)
+    elif not FLAGS.sync:
+      self.PrintJobStartInfo(job)
+    else:
+      print "Table '%s' successfully copied to '%s'" % (
+          source_reference, dest_reference)
 
 
 class _Make(BigqueryCmd):
@@ -947,6 +998,7 @@ class _Make(BigqueryCmd):
         flag_values=fv)
 
   def RunWithArgs(self, identifier='', schema=''):
+    # pylint:disable-msg=C6115
     """Create a dataset or table with this name.
 
     See 'bq help load' for more information on specifying the schema.
@@ -1047,7 +1099,9 @@ class _Show(BigqueryCmd):
           formatter, type(reference), print_format='show')
       object_info = BigqueryClient.FormatInfoByKind(object_info)
       formatter.AddDict(object_info)
+      print '%s %s\n' % (reference.typename.capitalize(), reference)
       formatter.Print()
+      print
     else:
       formatter = _GetFormatterFromFlags()
       formatter.AddColumns(object_info.keys())
@@ -1083,6 +1137,7 @@ class _Wait(BigqueryCmd):
   usage = """wait [<job_id>] [<secs>]"""
 
   def RunWithArgs(self, job_id='', secs=sys.maxint):
+    # pylint:disable-msg=C6115
     """Wait some number of seconds for a job to finish.
 
     Poll job_id until either (1) the job is DONE or (2) the
@@ -1106,24 +1161,21 @@ class _Wait(BigqueryCmd):
       raise app.UsageError('Invalid wait time: %s' % (secs,))
 
     client = Client.Get()
-    project_ref = client.GetProjectReference()
     if not job_id:
       # TODO(user): Fix this once a new version of apiclient
       # This is a mild hack: there seems to be a bug in the discovery
       # client involving repeated enum fields, so we make two calls.
       # (Do not stare directly at the race condition, it may cause
       # blindness.)
-      running_jobs = client.ListJobs(
-          reference=project_ref, state_filter='RUNNING')
-      running_jobs.extend(client.ListJobs(
-          reference=project_ref, state_filter='PENDING'))
-      if len(running_jobs) == 1:
-        job_id = running_jobs[0].get('jobReference', {}).get('jobId')
-      else:
+      running_jobs = client.ListJobRefs(state_filter='PENDING')
+      running_jobs.extend(client.ListJobRefs(state_filter='RUNNING'))
+      if len(running_jobs) != 1:
         raise bigquery_client.BigqueryError(
             'No job_id provided, found %d running jobs' % (len(running_jobs),))
+      job_reference = running_jobs.pop()
+    else:
+      job_reference = client.GetJobReference(job_id)
 
-    job_reference = JobReference.Create(projectId=project_ref, jobId=job_id)
     client.WaitJob(job_reference=job_reference, wait=secs)
 
 
@@ -1319,10 +1371,7 @@ class _Init(BigqueryCmd):
       print 'configuration?'
       print
 
-      response = None
-      while response not in ['y', 'n', '']:
-        response = raw_input('Overwrite %s? (y/N) ' % (bigqueryrc,)).lower()
-      if response != 'y':
+      if 'y' != _PromptYN('Overwrite %s? (y/N) ' % (bigqueryrc,)):
         print 'NOT overwriting %s, exiting.' % (bigqueryrc,)
         return 0
       print
@@ -1372,8 +1421,8 @@ class _Init(BigqueryCmd):
 
         response = None
         while not isinstance(response, int):
-          response = raw_input('Enter a selection (1 - %s): ' % (
-              len(projects),))
+          response = _PromptWithDefault(
+              'Enter a selection (1 - %s): ' % (len(projects),))
           try:
             if not response or 1 <= int(response) <= len(projects):
               response = int(response or 0)
@@ -1385,9 +1434,13 @@ class _Init(BigqueryCmd):
               projects[response - 1])
           entries['project_id'] = project_reference.projectId
 
-    with open(bigqueryrc, 'w') as rcfile:
-      for flag, value in entries.iteritems():
-        print >>rcfile, '%s = %s' % (flag, value)
+    try:
+      with open(bigqueryrc, 'w') as rcfile:
+        for flag, value in entries.iteritems():
+          print >>rcfile, '%s = %s' % (flag, value)
+    except IOError, e:
+      print 'Error writing %s: %s' % (bigqueryrc, e)
+      return 1
 
     print 'BigQuery configuration complete! Type "bq" to get started.'
     print
@@ -1396,6 +1449,30 @@ class _Init(BigqueryCmd):
     # pick up new flag values.
     Client.Delete()
     return 0
+
+
+class _DeleteCredentials(BigqueryCmd):
+  """Deletes the credential file cached by "bq init"."""
+
+  def __init__(self, name, fv):
+    super(_DeleteCredentials, self).__init__(name, fv)
+    self.surface_in_shell = False
+
+  def RunWithArgs(self):
+    """Deletes this user's credential file."""
+    _ProcessBigqueryrc()
+    filename = FLAGS.credential_file
+    if not os.path.exists(filename):
+      print 'Credential file %s does not exist.' % (filename,)
+      return 0
+    try:
+      if 'y' != _PromptYN('Delete credential file %s? (y/N) ' % (filename,)):
+        print 'NOT deleting %s, exiting.' % (filename,)
+        return 0
+      os.remove(filename)
+    except OSError, e:
+      print 'Error removing %s: %s' % (filename, e)
+      return 1
 
 
 class _Version(BigqueryCmd):
@@ -1438,10 +1515,11 @@ def main(argv):
     appcommands.AddCmd('version', _Version)
     appcommands.AddCmd('shell', _Repl)
     appcommands.AddCmd('init', _Init)
+    appcommands.AddCmd('delete_credentials', _DeleteCredentials)
 
     if (not argv or
         (len(argv) > 1 and
-         argv[1] not in ['init', 'help', 'version'] and
+         argv[1] not in ['init', 'help', 'version', 'delete_credentials'] and
          argv[1] in appcommands.GetCommandList())):
       if not (os.path.exists(_GetBigqueryRcFilename()) or
               os.path.exists(FLAGS.credential_file)):
@@ -1452,8 +1530,10 @@ def main(argv):
     sys.exit(1)
   except BaseException, e:  # pylint:disable-msg=W0703
     print 'Error initializing bq client: %s' % (e,)
-    if FLAGS.debug_mode:
-      pdb.post_mortem()
+    if FLAGS.debug_mode or FLAGS.headless:
+      traceback.print_exc()
+      if not FLAGS.headless:
+        pdb.post_mortem()
     sys.exit(1)
 
 
