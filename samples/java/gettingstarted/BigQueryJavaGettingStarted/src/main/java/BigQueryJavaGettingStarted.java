@@ -49,12 +49,15 @@ import java.util.List;
 public class BigQueryJavaGettingStarted {
 
   /////////////////////////
-  // USER GENERATED VALUES: you must fill in values specific to your application
+  // USER GENERATED VALUES: you must fill in values specific to your application.
   //
   // Visit the Google API Console to create a Project and generate an
-  // OAuth 2.0 Client ID and Secret (http://code.google.com/apis/console)
+  // OAuth 2.0 Client ID and Secret (http://code.google.com/apis/console).
+  // Then, add the Project ID below, and update the clientsecrets.json file
+  // with your client_id and client_secret
+  //
   /////////////////////////
-  private static final String PROJECT_ID = "686269325431";
+  private static final String PROJECT_ID = "XXXXXXXXX";
   private static final String CLIENTSECRETS_LOCATION = "clientsecrets.json";
 
   static GoogleClientSecrets clientSecrets = loadClientSecrets();
@@ -94,7 +97,7 @@ public class BigQueryJavaGettingStarted {
 
   /**
    * Creates an authorized BigQuery client service using the OAuth 2.0 protocol
-   * <p>
+   *
    * This method first creates a BigQuery authorization URL, then prompts the
    * user to visit this URL in a web browser to authorize access. The
    * application will wait for the user to paste the resulting authorization
@@ -190,7 +193,7 @@ public class BigQueryJavaGettingStarted {
       throws IOException, InterruptedException {
     // Variables to keep track of total query time
     long startTime = System.currentTimeMillis();
-    long elapsedTime = 0;
+    long elapsedTime;
 
     while (true) {
       Job pollJob = bigquery.jobs().get(projectId, jobId.getJobId()).execute();
@@ -219,7 +222,7 @@ public class BigQueryJavaGettingStarted {
                                           String projectId, Job completedJob) throws IOException {
     GetQueryResultsResponse queryResult = bigquery.jobs()
         .getQueryResults(
-            PROJECT_ID, completedJob
+            projectId, completedJob
             .getJobReference()
             .getJobId()
         ).execute();
@@ -256,7 +259,7 @@ public class BigQueryJavaGettingStarted {
   /**
    * Exchange the authorization code for OAuth 2.0 credentials.
    *
-   * @return
+   * @return an authorized Google Auth flow
    */
   static Credential exchangeCode(String authorizationCode) throws IOException {
     GoogleAuthorizationCodeFlow flow = getFlow();
@@ -268,6 +271,8 @@ public class BigQueryJavaGettingStarted {
 
   /**
    * Build an authorization flow and store it as a static class attribute.
+   *
+   * @return a Google Auth flow object
    */
   static GoogleAuthorizationCodeFlow getFlow() {
     if (flow == null) {
