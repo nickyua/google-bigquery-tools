@@ -12,37 +12,35 @@
  * the License.
  */
 
-import com.google.api.client.auth.oauth2.draft10.AccessTokenResponse;
-import com.google.api.client.googleapis.auth.oauth2.draft10.GoogleAccessProtectedResource;
-import com.google.api.client.googleapis.auth.oauth2.draft10.GoogleAccessTokenRequest.GoogleAuthorizationCodeGrant;
-import com.google.api.client.googleapis.auth.oauth2.draft10.GoogleAuthorizationRequestUrl;
+
+import com.google.api.client.auth.oauth2.Credential;
+import com.google.api.client.googleapis.auth.oauth2.GoogleAuthorizationCodeFlow;
+import com.google.api.client.googleapis.auth.oauth2.GoogleAuthorizationCodeRequestUrl;
+import com.google.api.client.googleapis.auth.oauth2.GoogleClientSecrets;
+import com.google.api.client.googleapis.auth.oauth2.GoogleTokenResponse;
 
 import com.google.api.client.http.HttpTransport;
 import com.google.api.client.http.javanet.NetHttpTransport;
-import com.google.api.client.http.json.JsonHttpRequest;
-import com.google.api.client.http.json.JsonHttpRequestInitializer;
 import com.google.api.client.json.JsonFactory;
 import com.google.api.client.json.jackson.JacksonFactory;
 
 import com.google.api.services.bigquery.Bigquery;
 import com.google.api.services.bigquery.Bigquery.Datasets;
-import com.google.api.services.bigquery.Bigquery.Jobs.GetQueryResults;
 import com.google.api.services.bigquery.Bigquery.Jobs.Insert;
-import com.google.api.services.bigquery.BigqueryRequest;
 import com.google.api.services.bigquery.model.DatasetList;
-import com.google.api.services.bigquery.model.DatasetListDatasets;
 import com.google.api.services.bigquery.model.GetQueryResultsResponse;
 import com.google.api.services.bigquery.model.Job;
 import com.google.api.services.bigquery.model.JobConfiguration;
 import com.google.api.services.bigquery.model.JobConfigurationQuery;
 import com.google.api.services.bigquery.model.JobReference;
 import com.google.api.services.bigquery.model.TableRow;
-import com.google.api.services.bigquery.model.TableRowF;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.util.Arrays;
 import java.util.List;
+
 
 /**
  * Sample class demonstrating how to get started with BigQuery
@@ -51,20 +49,24 @@ import java.util.List;
 public class BigQueryJavaGettingStarted {
 
   /////////////////////////
-  // USER GENERATED FILES: you must fill in values specific to your application
-  // 
+  // USER GENERATED VALUES: you must fill in values specific to your application
+  //
   // Visit the Google API Console to create a Project and generate an
   // OAuth 2.0 Client ID and Secret (http://code.google.com/apis/console)
   /////////////////////////
-  private static final String CLIENT_ID = "";
-  private static final String CLIENT_SECRET = "";
-  private static final String PROJECT_ID = "";
+  private static final String PROJECT_ID = "686269325431";
+  private static final String CLIENTSECRETS_LOCATION = "clientsecrets.json";
+
+  static GoogleClientSecrets clientSecrets = loadClientSecrets();
 
   // Static variables for API scope, callback URI, and HTTP/JSON functions
-  private static final String SCOPE = "https://www.googleapis.com/auth/bigquery";
-  private static final String CALLBACK_URL = "urn:ietf:wg:oauth:2.0:oob";
+  private static final List<String> SCOPES = Arrays.asList(
+      "https://www.googleapis.com/auth/bigquery");
+  private static final String REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob";
   private static final HttpTransport TRANSPORT = new NetHttpTransport();
   private static final JsonFactory JSON_FACTORY = new JacksonFactory();
+
+  private static GoogleAuthorizationCodeFlow flow = null;
 
   /**
    * @param args
@@ -103,45 +105,30 @@ public class BigQueryJavaGettingStarted {
    */
   public static Bigquery createAuthorizedClient() throws IOException {
 
-    // Generate the URL to which we will direct users
-    String authorizeUrl = new GoogleAuthorizationRequestUrl(CLIENT_ID,
-        CALLBACK_URL, SCOPE).build();
+    String authorizeUrl = new GoogleAuthorizationCodeRequestUrl(
+        clientSecrets,
+        REDIRECT_URI,
+        SCOPES).setState("").build();
+
     System.out.println("Paste this URL into a web browser to authorize BigQuery Access:\n" + authorizeUrl);
 
-    // Prompt for user to enter their authorization code
-    System.out.println("Type the code you received here: ");
+    System.out.println("... and type the code you received here: ");
     BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
     String authorizationCode = in.readLine();
 
-    // Generate an authorization URL - this will be shown to the user
-    // so the client can obtain an access token
-    AccessTokenResponse response = new GoogleAuthorizationCodeGrant(
-        TRANSPORT, JSON_FACTORY, CLIENT_ID, CLIENT_SECRET,
-        authorizationCode, CALLBACK_URL).execute();
-    System.out.format("\naccessToken=%s\nrefreshToken=%s\n\n",
-        response.accessToken, response.refreshToken);
+    // Exchange the auth code for an access token and refesh token
+    Credential credential = exchangeCode(authorizationCode);
 
-    GoogleAccessProtectedResource accessProtectedResource;
-    accessProtectedResource = new GoogleAccessProtectedResource(
-        response.accessToken, TRANSPORT, JSON_FACTORY,
-        CLIENT_ID, CLIENT_SECRET, response.refreshToken);
-
-    Bigquery bigquery = Bigquery.builder(TRANSPORT, JSON_FACTORY)
-        .setHttpRequestInitializer(accessProtectedResource)
-        .setJsonHttpRequestInitializer(new JsonHttpRequestInitializer() {
-          public void initialize(JsonHttpRequest request) {
-            BigqueryRequest bigqueryRequest = (BigqueryRequest) request;
-            bigqueryRequest.setPrettyPrint(true);
-          }
-        }).build();
-
-    return bigquery;
+    return Bigquery.builder(TRANSPORT, JSON_FACTORY)
+        .setHttpRequestInitializer(credential)
+        .setApplicationName("Your User Agent Here")
+        .build();
   }
 
   /**
    * Display all BigQuery Datasets associated with a Project
    *
-   * @param bigquery an authorized BigQuery client
+   * @param bigquery  an authorized BigQuery client
    * @param projectId a string containing the current project ID
    * @throws IOException
    */
@@ -150,9 +137,10 @@ public class BigQueryJavaGettingStarted {
     Datasets.List datasetRequest = bigquery.datasets().list(projectId);
     DatasetList datasetList = datasetRequest.execute();
     if (datasetList.getDatasets() != null) {
-      List<DatasetListDatasets> datasets = datasetList.getDatasets();
+      List<DatasetList.Datasets> datasets = datasetList.getDatasets();
       System.out.println("Available datasets\n----------------");
-      for (DatasetListDatasets dataset : datasets) {
+      System.out.println(datasets.toString());
+      for (DatasetList.Datasets dataset : datasets) {
         System.out.format("%s\n", dataset.getDatasetReference().getDatasetId());
       }
     }
@@ -161,14 +149,14 @@ public class BigQueryJavaGettingStarted {
   /**
    * Creates a Query Job for a particular query on a dataset
    *
-   * @param bigquery an authorized BigQuery client
+   * @param bigquery  an authorized BigQuery client
    * @param projectId a String containing the current Project ID
-   * @param querySql the actual query string
+   * @param querySql  the actual query string
    * @return a reference to the inserted query Job
    * @throws IOException
    */
   public static JobReference startQuery(Bigquery bigquery, String projectId,
-      String querySql) throws IOException {
+                                        String querySql) throws IOException {
     System.out.format("\nInserting Query Job: %s\n", querySql);
 
     Job job = new Job();
@@ -179,9 +167,9 @@ public class BigQueryJavaGettingStarted {
     job.setConfiguration(config);
     queryConfig.setQuery(querySql);
 
-    Insert insert = bigquery.jobs().insert(job);
+    Insert insert = bigquery.jobs().insert(projectId, job);
     insert.setProjectId(projectId);
-    JobReference jobId =  insert.execute().getJobReference();
+    JobReference jobId = insert.execute().getJobReference();
 
     System.out.format("\nJob ID of Query Job is: %s\n", jobId.getJobId());
 
@@ -191,9 +179,9 @@ public class BigQueryJavaGettingStarted {
   /**
    * Polls the status of a BigQuery job, returns Job reference if "Done"
    *
-   * @param bigquery an authorized BigQuery client
+   * @param bigquery  an authorized BigQuery client
    * @param projectId a string containing the current project ID
-   * @param jobId a reference to an inserted query Job
+   * @param jobId     a reference to an inserted query Job
    * @return a reference to the completed Job
    * @throws IOException
    * @throws InterruptedException
@@ -212,7 +200,7 @@ public class BigQueryJavaGettingStarted {
       if (pollJob.getStatus().getState().equals("DONE")) {
         return pollJob;
       }
-      // Pause execution for one second before polling job status again, to 
+      // Pause execution for one second before polling job status again, to
       // reduce unnecessary calls to the BigQUery API and lower overall
       // application bandwidth.
       Thread.sleep(1000);
@@ -222,27 +210,78 @@ public class BigQueryJavaGettingStarted {
   /**
    * Makes an API call to the BigQuery API
    *
-   * @param bigquery an authorized BigQuery client
-   * @param projectId a string containing the current project ID
-   * @param completedJob to the completed Job 
+   * @param bigquery     an authorized BigQuery client
+   * @param projectId    a string containing the current project ID
+   * @param completedJob to the completed Job
    * @throws IOException
    */
   private static void displayQueryResults(Bigquery bigquery,
-      String projectId, Job completedJob) throws IOException {
+                                          String projectId, Job completedJob) throws IOException {
     GetQueryResultsResponse queryResult = bigquery.jobs()
         .getQueryResults(
-            PROJECT_ID,completedJob
+            PROJECT_ID, completedJob
             .getJobReference()
             .getJobId()
-            ).execute();
+        ).execute();
     List<TableRow> rows = queryResult.getRows();
     System.out.print("\nQuery Results:\n------------\n");
     for (TableRow row : rows) {
-      for (TableRowF field : row.getF()){
+      for (TableRow.F field : row.getF()) {
         System.out.printf("%-20s", field.getV());
       }
       System.out.println();
     }
   }
+
+
+  /**
+   * Helper to load client ID/Secret from file.
+   *
+   * @return a GoogleClientSecrets object based on a clientsecrets.json
+   */
+  private static GoogleClientSecrets loadClientSecrets() {
+    try {
+      GoogleClientSecrets clientSecrets =
+          GoogleClientSecrets.load(new JacksonFactory(),
+              BigQueryJavaGettingStarted.class.getResourceAsStream(CLIENTSECRETS_LOCATION));
+      return clientSecrets;
+    } catch (Exception e) {
+      System.out.println("Could not load clientsecrets.json");
+      e.printStackTrace();
+    }
+    return clientSecrets;
+  }
+
+
+  /**
+   * Exchange the authorization code for OAuth 2.0 credentials.
+   *
+   * @return
+   */
+  static Credential exchangeCode(String authorizationCode) throws IOException {
+    GoogleAuthorizationCodeFlow flow = getFlow();
+    GoogleTokenResponse response =
+        flow.newTokenRequest(authorizationCode).setRedirectUri(REDIRECT_URI).execute();
+    return flow.createAndStoreCredential(response, null);
+  }
+
+
+  /**
+   * Build an authorization flow and store it as a static class attribute.
+   */
+  static GoogleAuthorizationCodeFlow getFlow() {
+    if (flow == null) {
+      HttpTransport httpTransport = new NetHttpTransport();
+      JacksonFactory jsonFactory = new JacksonFactory();
+
+      flow = new GoogleAuthorizationCodeFlow.Builder(httpTransport,
+          jsonFactory,
+          clientSecrets,
+          SCOPES)
+          .setAccessType("offline").setApprovalPrompt("force").build();
+    }
+    return flow;
+  }
+
 
 }
