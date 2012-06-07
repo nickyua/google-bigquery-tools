@@ -230,7 +230,7 @@ public class BigQueryJavaGettingStarted {
     System.out.print("\nQuery Results:\n------------\n");
     for (TableRow row : rows) {
       for (TableRow.F field : row.getF()) {
-        System.out.printf("%s", field.getV());
+        System.out.printf("%-20s", field.getV());
       }
       System.out.println();
     }
