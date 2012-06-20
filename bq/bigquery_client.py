@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import textwrap
 import time
 
 
@@ -37,18 +38,40 @@ def _ToLowerCamel(name):
   return re.sub('_[a-z]', lambda match: match.group(0)[1].upper(), name)
 
 
+def _ApplyParameters(config, **kwds):
+  """Adds all kwds to config dict, adjusting names to camelcase."""
+  config.update((_ToLowerCamel(k), v) for k, v in kwds.iteritems() if v)
+
+
 class BigqueryError(Exception):
 
   @staticmethod
-  def Create(error, server_error):
-    """Returns a BigqueryError for json error embedded in server_error."""
-    # TODO(user): All errors should have reason and message,
-    # but we currently have a couple error cases that don't
-    # honor this. Remove this work-around of inspecting multiple
-    # fields when it is no longer needed.
-    reason = error.get('reason') or error.get('code')
-    message = (error.get('message') or error.get('errorMessage') or
-               '%s: %s' % (reason, ' '.join(error.get('arguments', []))))
+  def Create(error, server_error, error_ls):
+    """Returns a BigqueryError for json error embedded in server_error.
+
+    If error_ls contains any errors other than the given one, those
+    are also included in the returned message.
+
+    Args:
+      error: The primary error to convert.
+      server_error: The error returned by the server. (This is only used
+        in the case that error is malformed.)
+      error_ls: Additional errors to include in the error message.
+
+    Returns:
+      BigqueryError representing error.
+    """
+    reason = error.get('reason')
+    message = error.get('message')
+    # We don't want to repeat the "main" error message.
+    new_errors = [err for err in error_ls if err != error]
+    if new_errors:
+      message += '\nFailure details:\n'
+      message += '\n'.join(
+          textwrap.fill(err.get('message', ''),
+                        initial_indent=' - ',
+                        subsequent_indent='   ')
+          for err in new_errors)
     if not reason or not message:
       return BigqueryInterfaceError(
           'Error reported by server with missing error fields. '
@@ -115,6 +138,11 @@ class BigqueryClientError(BigqueryError):
   pass
 
 
+class BigqueryClientConfigurationError(BigqueryClientError):
+  """Invalid configuration of BigqueryClient."""
+  pass
+
+
 class BigquerySchemaError(BigqueryClientError):
   """Error in locating or parsing the schema."""
   pass
@@ -162,7 +190,7 @@ class BigqueryHttp(http_request.HttpRequest):
         BigqueryClient.RaiseError(json.loads(e.content))
       else:
         raise BigqueryCommunicationError(
-            'Error communicating with BigQuery server, server returned ' +
+            'Could not connect with BigQuery server, http response status: ' +
             e.resp.get('status', '(unexpected)'))
 
 
@@ -177,7 +205,12 @@ class BigqueryClient(object):
       api_version: the version of the api to connect to, for example "v2".
 
     Optional keywords:
-      project_id: a default project id to use.
+      project_id: a default project id to use. While not required for
+        initialization, a project_id is required when calling any
+        method that creates a job on the server. Methods that have
+        this requirement pass through **kwds, and will raise
+        BigqueryClientConfigurationError if no project_id can be
+        found.
       dataset_id: a default dataset id to use.
       discovery_document: the discovery document to use. If not
         specified, one will be retrieved from the discovery api.
@@ -325,7 +358,10 @@ class BigqueryClient(object):
 
     This will parse the identifier into a tuple of the form
     (project_id, dataset_id, table_id) without doing any validation on
-    the resulting names; missing names are returned as ''.
+    the resulting names; missing names are returned as ''. The
+    interpretation of these identifiers depends on the context of the
+    caller. For example, if you know the identifier must be a job_id,
+    then you can assume dataset_id is the job_id.
 
     Args:
       identifier: string, identifier to parse
@@ -338,8 +374,6 @@ class BigqueryClient(object):
     if re.search('^\w[\w.]*\.[\w.]+:\w[\w\d_-]*:?$', identifier):
       return identifier, '', ''
     project_id, _, dataset_and_table_id = identifier.rpartition(':')
-    # Note that the two below only differ in the case that '.' is not
-    # present.
     if project_id:
       dataset_id, _, table_id = dataset_and_table_id.partition('.')
     else:
@@ -431,16 +465,31 @@ class BigqueryClient(object):
       pass
     raise BigqueryError('Cannot determine reference for "%s"' % (identifier,))
 
+  # TODO(user): consider introducing job-specific and possibly
+  # dataset- and project-specific parsers for the case of knowing what
+  # type we are looking for. Reinterpreting "dataset_id" as "job_id"
+  # is rather confusing.
   def GetJobReference(self, identifier=''):
     """Determine a JobReference from an identifier and self."""
-    project_id, job_id = BigqueryClient._ParseIdentifier(identifier)
-    try:
-      return ApiClientHelper.JobReference.Create(
-          projectId=project_id or self.project_id,
-          jobId=job_id)
-    except ValueError:
-      raise BigqueryError('Cannot determine job described by %s' % (
-          identifier,))
+    project_id, dataset_id, table_id = BigqueryClient._ParseIdentifier(
+        identifier)
+    if table_id and not project_id and not dataset_id:
+      # identifier is 'foo'
+      project_id = self.project_id
+      job_id = table_id
+    elif project_id and dataset_id and not table_id:
+      # identifier is 'foo:bar'
+      job_id = dataset_id
+    else:
+      job_id = None
+    if job_id:
+      try:
+        return ApiClientHelper.JobReference.Create(
+            projectId=project_id, jobId=job_id)
+      except ValueError:
+        pass
+    raise BigqueryError('Cannot determine job described by %s' % (
+        identifier,))
 
   def GetObjectInfo(self, reference):
     """Get all data returned by the server about a specific object."""
@@ -537,7 +586,8 @@ class BigqueryClient(object):
         formatter.AddColumns(('tableId',))
       if print_format == 'show':
         formatter.AddColumns(('Last modified', 'Schema',
-                              'Total Rows', 'Total Bytes',))
+                              'Total Rows', 'Total Bytes',
+                              'Expiration'))
     else:
       raise ValueError('Unknown reference type: %s' % (
           reference_type.__name__,))
@@ -545,8 +595,8 @@ class BigqueryClient(object):
   @staticmethod
   def RaiseError(result):
     """Raises an appropriate BigQuery error given the json error result."""
-    error = result.get('error', {}).get('errors', [None])[0]
-    raise BigqueryError.Create(error, result)
+    error = result.get('error', {}).get('errors', [{}])[0]
+    raise BigqueryError.Create(error, result, [])
 
   @staticmethod
   def IsFailedJob(job):
@@ -569,13 +619,14 @@ class BigqueryClient(object):
     """
     if BigqueryClient.IsFailedJob(job):
       error = job['status']['errorResult']
-      raise BigqueryError.Create(error, error)
+      error_ls = job['status'].get('errors', [])
+      raise BigqueryError.Create(error, error, error_ls)
     return job
 
   @staticmethod
   def GetJobTypeName(job_info):
     """Helper for job printing code."""
-    job_names = set(('extract', 'load', 'query', 'link'))
+    job_names = set(('extract', 'load', 'query', 'copy'))
     try:
       return set(job_info.get('configuration', {}).keys()).intersection(
           job_names).pop()
@@ -648,7 +699,7 @@ class BigqueryClient(object):
 
     if not schema:
       raise BigquerySchemaError('Schema cannot be empty')
-    elif ':' not in schema and os.path.exists(schema):
+    elif os.path.exists(schema):
       with open(schema) as f:
         try:
           return json.load(f)
@@ -768,6 +819,9 @@ class BigqueryClient(object):
       result['Total Bytes'] = result['numBytes']
     if 'numRows' in result:
       result['Total Rows'] = result['numRows']
+    if 'expirationTime' in result:
+      result['Expiration'] = BigqueryClient.FormatTime(
+          int(result['expirationTime']) / 1000)
     return result
 
   @staticmethod
@@ -820,26 +874,39 @@ class BigqueryClient(object):
         BigqueryClient.ConstructObjectReference, self.ListJobs(**kwds))
 
   def ListJobs(self, reference=None,
-               max_results=None, page_token=None, state_filter=None):
-    """Return a list of jobs."""
+               max_results=None, state_filter=None):
+    """Return a list of jobs.
+
+    Args:
+      reference: The ProjectReference to list jobs for.
+      max_results: The maximum number of jobs to return.
+      state_filter: A single state filter or a list of filters to
+        apply. If not specified, no filtering is applied.
+
+    Returns:
+      A list of jobs.
+    """
     reference = self._NormalizeProjectReference(reference)
     _Typecheck(reference, ApiClientHelper.ProjectReference, method='ListJobs')
-    request = self._PrepareListRequest(reference, max_results, page_token)
+    request = self._PrepareListRequest(reference, max_results, None)
     request['projection'] = 'full'
     if state_filter is not None:
       # The apiclient wants enum values as lowercase strings.
-      # TODO(user): Iterate over the state_filter argument once
-      # apiclient supports that.
-      request['stateFilter'] = state_filter.lower()
+      if isinstance(state_filter, basestring):
+        state_filter = state_filter.lower()
+      else:
+        state_filter = [s.lower() for s in state_filter]
+      request['stateFilter'] = state_filter
     jobs = self.apiclient.jobs().list(**request).execute()
     return jobs.get('jobs', [])
 
   def ListProjectRefs(self, **kwds):
+    """List the project references this user has access to."""
     return map(  # pylint:disable-msg=C6402
         BigqueryClient.ConstructObjectReference, self.ListProjects(**kwds))
 
   def ListProjects(self, max_results=None, page_token=None):
-    """List the projects associated with this account."""
+    """List the projects this user has access to."""
     request = self._PrepareListRequest({}, max_results, page_token)
     result = self.apiclient.projects().list(**request).execute()
     return result.get('projects', [])
@@ -873,16 +940,19 @@ class BigqueryClient(object):
   #################################
 
   def CopyTable(self, source_reference, dest_reference,
-                write_disposition=None, ignore_already_exists=False):
+                create_disposition=None, write_disposition=None,
+                ignore_already_exists=False, **kwds):
     """Copies a table.
 
     Args:
       source_reference: TableReference of source table.
       dest_reference: TableReference of destination table.
-      write_disposition: Optional, one of 'WRITE_EMPTY' or
-        'WRITE_TRUNCATE' or 'WRITE_APPEND'. If not specified, the
-        copy api default will be used.
+      create_disposition: Optional. Specifies the create_disposition for
+          the dest_reference.
+      write_disposition: Optional. Specifies the write_disposition for
+          the dest_reference.
       ignore_already_exists: Whether to ignore "already exists" errors.
+      **kwds: Passed on to ExecuteJob.
 
     Returns:
       The job description, or None for ignored errors.
@@ -899,10 +969,10 @@ class BigqueryClient(object):
         'destinationTable': dict(dest_reference),
         'sourceTable': dict(source_reference),
         }
-    if write_disposition:
-      copy_config['writeDisposition'] = write_disposition
+    _ApplyParameters(copy_config, create_disposition=create_disposition,
+                     write_disposition=write_disposition)
     try:
-      return self.ExecuteJob({'copy': copy_config})
+      return self.ExecuteJob({'copy': copy_config}, **kwds)
     except BigqueryDuplicateError, e:
       if ignore_already_exists:
         return None
@@ -925,13 +995,16 @@ class BigqueryClient(object):
     except BigqueryNotFoundError:
       return False
 
-  def CreateDataset(self, reference, ignore_existing=False):
+  def CreateDataset(self, reference, ignore_existing=False, description=None,
+                    friendly_name=None):
     """Create a dataset corresponding to DatasetReference.
 
     Args:
       reference: the DatasetReference to create.
       ignore_existing: (boolean, default False) If False, raise
         an exception if the dataset already exists.
+      description: an optional dataset description.
+      friendly_name: an optional friendly name for the dataset.
 
     Raises:
       TypeError: if reference is not a DatasetReference.
@@ -941,25 +1014,34 @@ class BigqueryClient(object):
     _Typecheck(reference, ApiClientHelper.DatasetReference,
                method='CreateDataset')
 
+    body = BigqueryClient.ConstructObjectInfo(reference)
+    if friendly_name is not None:
+      body['friendlyName'] = friendly_name
+    if description is not None:
+      body['description'] = description
     try:
       self.apiclient.datasets().insert(
-          body=BigqueryClient.ConstructObjectInfo(reference),
+          body=body,
           **dict(reference.GetProjectReference())).execute()
     except BigqueryDuplicateError:
       if not ignore_existing:
         raise
 
-  def CreateTable(self, reference, ignore_existing=False, schema=None):
-    """Create a dataset corresponding to DatasetReference.
+  def CreateTable(self, reference, ignore_existing=False, schema=None,
+                  description=None, friendly_name=None, expiration=None):
+    """Create a table corresponding to TableReference.
 
     Args:
-      reference: the DatasetReference to create.
+      reference: the TableReference to create.
       ignore_existing: (boolean, default True) If False, raise
         an exception if the dataset already exists.
       schema: an optional schema.
+      description: an optional table description.
+      friendly_name: an optional friendly name for the table.
+      expiration: optional expiration time in milliseconds since the epoch.
 
     Raises:
-      TypeError: if reference is not a DatasetReference.
+      TypeError: if reference is not a TableReference.
       BigqueryDuplicateError: if reference exists and ignore_existing
         is False.
     """
@@ -969,12 +1051,69 @@ class BigqueryClient(object):
       body = BigqueryClient.ConstructObjectInfo(reference)
       if schema:
         body['schema'] = {'fields': schema}
+      if friendly_name is not None:
+        body['friendlyName'] = friendly_name
+      if description is not None:
+        body['description'] = description
+      if expiration is not None:
+        body['expirationTime'] = expiration
       self.apiclient.tables().insert(
           body=body,
           **dict(reference.GetDatasetReference())).execute()
     except BigqueryDuplicateError:
       if not ignore_existing:
         raise
+
+  def UpdateTable(self, reference, schema=None,
+                  description=None, friendly_name=None, expiration=None):
+    """Updates a table.
+
+    Args:
+      reference: the TableReference to update.
+      schema: an optional schema.
+      description: an optional table description.
+      friendly_name: an optional friendly name for the table.
+      expiration: optional expiration time in milliseconds since the epoch.
+
+    Raises:
+      TypeError: if reference is not a TableReference.
+    """
+    _Typecheck(reference, ApiClientHelper.TableReference, method='UpdateTable')
+
+    body = BigqueryClient.ConstructObjectInfo(reference)
+    if schema:
+      body['schema'] = {'fields': schema}
+    if friendly_name is not None:
+      body['friendlyName'] = friendly_name
+    if description is not None:
+      body['description'] = description
+    if expiration is not None:
+      body['expirationTime'] = expiration
+
+    self.apiclient.tables().patch(body=body, **dict(reference)).execute()
+
+  def UpdateDataset(self, reference,
+                    description=None, friendly_name=None):
+    """Updates a dataset.
+
+    Args:
+      reference: the DatasetReference to update.
+      description: an optional table description.
+      friendly_name: an optional friendly name for the dataset.
+
+    Raises:
+      TypeError: if reference is not a DatasetReference.
+    """
+    _Typecheck(reference, ApiClientHelper.DatasetReference,
+               method='UpdateDataset')
+
+    body = BigqueryClient.ConstructObjectInfo(reference)
+    if friendly_name is not None:
+      body['friendlyName'] = friendly_name
+    if description is not None:
+      body['description'] = description
+
+    self.apiclient.datasets().patch(body=body, **dict(reference)).execute()
 
   def DeleteDataset(self, reference, ignore_not_found=False,
                     delete_contents=None):
@@ -1028,19 +1167,38 @@ class BigqueryClient(object):
   ## Job control
   #################################
 
-  def StartJob(self, configuration, project_id=None, upload_file=None):
-    """Start a job with the given configuration."""
+  def StartJob(self, configuration,
+               project_id=None, upload_file=None, job_id=None):
+    """Start a job with the given configuration.
+
+    Args:
+      configuration: The configuration for a job.
+      project_id: The project_id to run the job under. If None,
+        self.project_id is used.
+      upload_file: A file to include as a media upload to this request.
+        Only valid on job requests that expect a media upload file.
+      job_id: A unique job_id to use for this job. If None, the server
+        will create a unique job_id for this request.
+
+    Returns:
+      The job resource returned from the insert job request.
+
+    Raises:
+      BigqueryClientConfigurationError: if project_id and
+        self.project_id are None.
+    """
     project_id = project_id or self.project_id
     if not project_id:
-      raise ValueError(
-          'Cannot start a job without a project id. Try '
-          'running "bq init".')
+      raise BigqueryClientConfigurationError(
+          'Cannot start a job without a project id.')
     configuration = configuration.copy()
     if self.job_property:
       configuration['properties'] = dict(
           prop.partition('=')[0::2] for prop in self.job_property)
     job_request = {'configuration': configuration}
-    media_upload = None
+    if job_id:
+      job_request['jobReference'] = {'jobId': job_id}
+    media_upload = ''
     if upload_file:
       media_upload = http_request.MediaFileUpload(
           filename=upload_file, mimetype='application/octet-stream',
@@ -1051,22 +1209,27 @@ class BigqueryClient(object):
     return result
 
   def RunJobSynchronously(self, configuration, project_id=None,
-                          upload_file=None):
+                          upload_file=None, job_id=None):
     result = self.StartJob(configuration, project_id=project_id,
-                           upload_file=upload_file)
+                           upload_file=upload_file, job_id=job_id)
     job_reference = BigqueryClient.ConstructObjectReference(result)
     result = self.WaitJob(job_reference)
     return self.RaiseIfJobError(result)
 
-  def ExecuteJob(self, configuration, sync=None, upload_file=None):
+  def ExecuteJob(self, configuration, sync=None,
+                 project_id=None, upload_file=None, job_id=None):
     """Execute a job, possibly waiting for results."""
     if sync is None:
       sync = self.sync
 
     if sync:
-      job = self.RunJobSynchronously(configuration, upload_file=upload_file)
+      job = self.RunJobSynchronously(
+          configuration, project_id=project_id, upload_file=upload_file,
+          job_id=job_id)
     else:
-      job = self.StartJob(configuration, upload_file=upload_file)
+      job = self.StartJob(
+          configuration, project_id=project_id, upload_file=upload_file,
+          job_id=job_id)
       self.RaiseIfJobError(job)
     return job
 
@@ -1222,16 +1385,21 @@ class BigqueryClient(object):
     job = self.Query(**new_kwds)
     return self.ReadTableRows(job['configuration']['query']['destinationTable'])
 
-  def Query(self, query, destination_table=None, **kwds):
+  def Query(self, query, destination_table=None,
+            create_disposition=None, write_disposition=None, **kwds):
     """Execute the given query, returning the created job.
 
-    The job will execute synchronously sync=True is provided as an argument
-    or if self.sync is true.
+    The job will execute synchronously if sync=True is provided as an
+    argument or if self.sync is true.
 
     Args:
       query: Query to execute.
       destination_table: (default None) If provided, send the results to the
           given table.
+      create_disposition: Optional. Specifies the create_disposition for
+          the destination_table.
+      write_disposition: Optional. Specifies the write_disposition for
+          the destination_table.
       **kwds: Passed on to self.ExecuteJob.
 
     Raises:
@@ -1252,19 +1420,35 @@ class BigqueryClient(object):
         raise BigqueryError('Invalid value %s for destination_table: %s' % (
             destination_table, e))
       query_config['destinationTable'] = dict(reference)
+    _ApplyParameters(
+        query_config, create_disposition=create_disposition,
+        write_disposition=write_disposition)
     return self.ExecuteJob({'query': query_config}, **kwds)
 
-  def Load(self, destination_table_reference, source, schema=None, **kwds):
+  def Load(self, destination_table_reference, source,
+           schema=None, create_disposition=None, write_disposition=None,
+           field_delimiter=None, skip_leading_rows=None, encoding=None,
+           max_bad_records=None, **kwds):
     """Load the given data into BigQuery.
 
-    The job will execute synchronously sync=True is provided as an argument
-    or if self.sync is true.
+    The job will execute synchronously if sync=True is provided as an
+    argument or if self.sync is true.
 
     Args:
       destination_table_reference: TableReference to load data into.
       source: String specifying source data to load.
       schema: (default None) Schema of the created table. (Can be left blank
           for append operations.)
+      create_disposition: Optional. Specifies the create_disposition for
+          the destination_table_reference.
+      write_disposition: Optional. Specifies the write_disposition for
+          the destination_table_reference.
+      field_delimiter: Optional. Specifies the single byte field delimiter.
+      skip_leading_rows: Optional. Number of rows of initial data to skip.
+      encoding: Optional. Specifies character encoding of the input data.
+          May be "UTF-8" or "ISO-8859-1". Defaults to UTF-8 if not specified.
+      max_bad_records: Optional. Maximum number of bad records that should
+          be ignored before the entire job is aborted.
       **kwds: Passed on to self.ExecuteJob.
 
     Returns:
@@ -1280,9 +1464,43 @@ class BigqueryClient(object):
       upload_file = sources[0]
     if schema is not None:
       load_config['schema'] = {'fields': BigqueryClient.ReadSchema(schema)}
-    load_config.update((_ToLowerCamel(k), v) for k, v in kwds.iteritems() if v)
+    _ApplyParameters(
+        load_config, create_disposition=create_disposition,
+        write_disposition=write_disposition, field_delimiter=field_delimiter,
+        skip_leading_rows=skip_leading_rows, encoding=encoding,
+        max_bad_records=max_bad_records)
     return self.ExecuteJob(configuration={'load': load_config},
-                           upload_file=upload_file)
+                           upload_file=upload_file, **kwds)
+
+  def Extract(self, source_table, destination_uri,
+              print_header=None, field_delimiter=None,
+              **kwds):
+    """Extract the given table from BigQuery.
+
+    The job will execute synchronously if sync=True is provided as an
+    argument or if self.sync is true.
+
+    Args:
+      source_table: TableReference to read data from.
+      destination_uri: String specifying destination location.
+      print_header: Optional. Whether to print out a header row in the results.
+      field_delimiter: Optional. Specifies the single byte field delimiter.
+      **kwds: Passed on to self.ExecuteJob.
+
+    Returns:
+      The resulting job info.
+
+    Raises:
+      BigqueryClientError: if required parameters are invalid.
+    """
+    _Typecheck(source_table, ApiClientHelper.TableReference)
+    if not destination_uri.startswith('gs://'):
+      raise BigqueryClientError('Extract only supports "gs://" uris.')
+    extract_config = {'sourceTable': dict(source_table)}
+    _ApplyParameters(
+        extract_config, destination_uri=destination_uri,
+        print_header=print_header, field_delimiter=field_delimiter)
+    return self.ExecuteJob(configuration={'extract': extract_config}, **kwds)
 
 
 class ApiClientHelper(object):

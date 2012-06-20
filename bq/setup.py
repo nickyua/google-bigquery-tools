@@ -25,7 +25,8 @@ import platform
 REQUIRED_PACKAGES = [
     'google-apputils',
     'python-gflags',
-    'google-api-python-client',
+    'google-api-python-client>=1.0c1',
+    'oauth2client>=1.0c1',
     'httplib2',
     ]
 CONSOLE_SCRIPTS = [
@@ -39,7 +40,7 @@ py_version = platform.python_version()
 if py_version < '2.6.5' or py_version >= '3':
   raise ValueError('BigQuery requires Python >= 2.6.5.')
 
-_BQ_VERSION = '2.0.4'
+_BQ_VERSION = '2.0.5'
 
 setup(name='bigquery',
       version=_BQ_VERSION,

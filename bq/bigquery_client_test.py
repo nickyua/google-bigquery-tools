@@ -139,6 +139,28 @@ class BigqueryClientTest(googletest.TestCase):
       self.assertRaises(bigquery_client.BigqueryError,
                         self.client.GetProjectReference, invalid)
 
+  def testParseJobReference(self):
+    self.assertTrue(self.client.GetJobReference('proj:job_id'))
+    self.client.project_id = None
+    self.assertRaises(bigquery_client.BigqueryError,
+                      self.client.GetJobReference, 'job_id')
+    self.client.project_id = 'proj'
+    self.assertTrue(self.client.GetJobReference('job_id'))
+
+    invalid_job_ids = [
+        'prj:', 'example.com:prj:ds.tbl', 'ds.tbl', 'prj:ds.tbl']
+
+    for invalid in invalid_job_ids:
+      self.assertRaises(bigquery_client.BigqueryError,
+                        self.client.GetJobReference, invalid)
+
+  def testRaiseError(self):
+    # Confirm we handle arbitrary errors gracefully.
+    try:
+      bigquery_client.BigqueryClient.RaiseError({})
+    except bigquery_client.BigqueryError as e:
+      pass
+
 
 if __name__ == '__main__':
   googletest.main()

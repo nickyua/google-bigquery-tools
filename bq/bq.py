@@ -7,13 +7,16 @@
 
 import cmd
 import codecs
+import json
 import logging
 import os
 import pdb
+import platform
 import readline  # pylint:disable-msg=W0611
 import shlex
 import stat
 import sys
+import time
 import traceback
 import types
 
@@ -21,8 +24,8 @@ import types
 # doesn't do this itself.
 
 
+import httplib2
 import oauth2client
-from oauth2client import anyjson
 import oauth2client.client
 import oauth2client.file
 import oauth2client.tools
@@ -31,8 +34,8 @@ from google.apputils import app
 from google.apputils import appcommands
 import gflags as flags
 
-import bigquery_client
 import table_formatter
+import bigquery_client
 
 flags.DEFINE_string(
     'apilog', '',
@@ -47,8 +50,6 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'api_version', 'v2',
     'API version to use.')
-# TODO(user): Have this capture enough information to make for a
-# useful bug report.
 flags.DEFINE_boolean(
     'debug_mode', False,
     'Show tracebacks on Python exceptions.')
@@ -83,6 +84,13 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'dataset_id', '',
     'Default dataset to use for requests. (Ignored when not applicable.)')
+# This flag is "hidden" at the global scope to avoid polluting help
+# text on individual commands for rarely used functionality.
+flags.DEFINE_string(
+    'job_id', None,
+    'A unique job_id to use for the request. If None, the server will create '
+    'a unique job_id. Applies only to commands that launch jobs, such as cp, '
+    'extract, link, load, and query. ')
 flags.DEFINE_boolean(
     'quiet', False,
     'If True, ignore status updates while jobs are running.',
@@ -91,7 +99,7 @@ flags.DEFINE_boolean(
     'headless',
     False,
     'Whether this bq session is running without user interaction. This '
-    'affects behavior that expect user interaction, like whether '
+    'affects behavior that expects user interaction, like whether '
     'debug_mode will break into the debugger and lowers the frequency '
     'of informational printing.')
 flags.DEFINE_enum(
@@ -109,11 +117,22 @@ flags.DEFINE_enum(
 flags.DEFINE_multistring(
     'job_property', None,
     'Additional key-value pairs to include in the properties field of '
-    'the job configuration. Can be specified multiple times on the '
-    'command line, and all key-value pairs will be included.')
+    'the job configuration')  # No period: Multistring adds flagspec suffix.
+flags.DEFINE_string(
+    'robot', '',
+    'Use this service account email address for authorization. '
+    'For example, 1234567890@developer.gserviceaccount.com')
+flags.DEFINE_string(
+    'robot_private_key_file', '',
+    'Filename that contains the service account private key. '
+    'Required if --robot is specified.')
+flags.DEFINE_string(
+    'robot_private_key_password', 'notasecret',
+    'Password for private key. This password must match the password '
+    'you set on the key when you created it in the Google APIs Console. '
+    'Defaults to the default Google APIs Console private key password.')
 
 FLAGS = flags.FLAGS
-json = anyjson.simplejson
 # These are long names.
 # pylint:disable-msg=C6409
 JobReference = bigquery_client.ApiClientHelper.JobReference
@@ -189,7 +208,6 @@ def _GetBigqueryRcFilename():
 
 def _ProcessBigqueryrc():
   """Updates FLAGS with values found in the bigqueryrc file."""
-  # TODO(user): Do more testing on Windows.
   bigqueryrc = _GetBigqueryRcFilename()
   if not os.path.exists(bigqueryrc):
     return
@@ -228,7 +246,28 @@ def _ResolveApiInfoFromFlags():
   return {'api': api, 'api_version': api_version}
 
 
+def _GetRobotCredentialsFromFlags():
+  try:
+    with file(FLAGS.robot_private_key_file, 'rb') as f:
+      key = f.read()
+  except IOError as e:
+    raise app.UsageError(
+        'Service account specified, but private key in file "%s" '
+        'cannot be read:\n%s' % (FLAGS.robot_private_key_file, e))
+  if not oauth2client.client.HAS_OPENSSL:
+    raise app.UsageError(
+        'BigQuery requires OpenSSL to be installed in order to use '
+        'service account credentials. Please install OpenSSL '
+        'and the Python OpenSSL package.')
+  return oauth2client.client.SignedJwtAssertionCredentials(
+      FLAGS.robot, key, _CLIENT_SCOPE,
+      private_key_password=FLAGS.robot_private_key_password,
+      user_agent=_CLIENT_USER_AGENT)
+
+
 def _GetCredentialsFromFlags():
+  if FLAGS.robot:
+    return _GetRobotCredentialsFromFlags()
 
   intended_perms = stat.S_IWUSR | stat.S_IRUSR
   if not os.path.exists(FLAGS.credential_file):
@@ -255,12 +294,10 @@ def _GetCredentialsFromFlags():
         message_prefix=(
             'Credentials appear corrupt. Please delete the credential file '
             'and try your command again. You can delete your credential '
-            'file using "bq delete_credentials".\n\nIf that does not work, '
-            'you may have encountered a bug in the BigQuery CLI.'))
+            'file using "bq init --delete_credentials".\n\nIf that does '
+            'not work, you may have encountered a bug in the BigQuery CLI.'))
     sys.exit(1)
 
-  # TODO(user): Catch errors here and send the user to a
-  # place to get more information (wiki?).
   if credentials is None or credentials.invalid:
     print
     print '******************************************************************'
@@ -284,6 +321,12 @@ def _GetCredentialsFromFlags():
         # a token.
         print 'Invalid authorization: %s' % (e,)
         print
+      except httplib2.HttpLib2Error as e:
+        print 'Error communicating with server. Please check your internet '
+        print 'connection and try again.'
+        print
+        print 'Error is: %s' % (e,)
+        sys.exit(1)
     print
     print '************************************************'
     print '** Continuing execution of BigQuery operation **'
@@ -332,6 +375,29 @@ def _PromptYN(message):
   return response
 
 
+def _NormalizeFieldDelimiter(field_delimiter):
+  """Validates and returns the correct field_delimiter."""
+  # The only non-string delimiter we allow is None, which represents
+  # no field delimiter specified by the user.
+  if field_delimiter is None:
+    return field_delimiter
+  try:
+    # We check the field delimiter flag specifically, since a
+    # mis-entered Thorn character generates a difficult to
+    # understand error during request serialization time.
+    _ = field_delimiter.decode(sys.stdin.encoding or 'utf8')
+  except UnicodeDecodeError:
+    raise app.UsageError(
+        'The field delimiter flag is not valid. Flags must be '
+        'specified in your default locale. For example, '
+        'the Latin 1 representation of Thorn is byte code FE, '
+        'which in the UTF-8 locale would be expressed as C3 BE.')
+
+  # Allow TAB and \\t substitution.
+  key = field_delimiter.lower()
+  return _DELIMITER_MAP.get(key, field_delimiter)
+
+
 class Client(object):
   """Class wrapping a singleton bigquery_client.BigqueryClient."""
   client = None
@@ -346,6 +412,7 @@ class Client(object):
     # Note that we need to handle possible initialization tasks
     # for the case of being loaded as a library.
     _ProcessBigqueryrc()
+    _SetupLoggerFromFlags()
     credentials = _GetCredentialsFromFlags()
     client_args = {}
     global_args = ('credential_file', 'job_property',
@@ -381,9 +448,10 @@ class Client(object):
 
 
 def _Typecheck(obj, types, message=None):  # pylint:disable-msg=W0621
+  """Raises a user error if obj is not an instance of types."""
   if not isinstance(obj, types):
     message = message or 'Type of %s is not one of %s' % (obj, types)
-    raise TypeError(message)
+    raise app.UsageError(message)
 
 
 # TODO(user): This code uses more than the average amount of
@@ -495,7 +563,10 @@ class NewCmd(appcommands.Cmd):
     return False
 
   def _HandleError(self, e):
-    print 'Exception raised in %s operation: %s' % (self._command_name, e)
+    message = str(e)
+    if isinstance(e, bigquery_client.BigqueryClientConfigurationError):
+      message += ' Try running "bq init".'
+    print 'Exception raised in %s operation: %s' % (self._command_name, message)
     return 1
 
   def RunDebug(self, args, kwds):
@@ -504,7 +575,9 @@ class NewCmd(appcommands.Cmd):
       self.RunWithArgs(*args, **kwds)
       return 0
     except BaseException, e:
-      if (isinstance(e, bigquery_client.BigqueryError) and
+      # Don't break into the debugger for expected exceptions.
+      if isinstance(e, app.UsageError) or (
+          isinstance(e, bigquery_client.BigqueryError) and
           not isinstance(e, bigquery_client.BigqueryInterfaceError)):
         return self._HandleError(e)
       print
@@ -561,9 +634,29 @@ class BigqueryCmd(NewCmd):
 
     contact_us_msg = (
         '%s%sPlease send an email to bigquery-team@google.com to '
-        'report this, and include the command you typed as well as '
-        'the following information: \n') % (
-            message_prefix, ' ' if message_prefix else '')
+        'report this, with the following information: \n\n') % (
+            message_prefix,
+            ' ' if message_prefix else '',
+            )
+    error_details = (
+        '========================================\n'
+        '== Platform ==\n'
+        '  %s\n'
+        '== bq version ==\n'
+        '  %s\n'
+        '== Command line ==\n'
+        '  %s\n'
+        '== Error trace ==\n'
+        '%s'
+        '========================================\n') % (
+            ':'.join([
+                platform.python_implementation(),
+                platform.python_version(),
+                platform.platform()]),
+            _Version.VersionNumber(),
+            sys.argv,
+            ''.join(traceback.format_tb(sys.exc_info()[2])),
+            )
 
     codecs.register_error('strict', codecs.replace_errors)
     message = BigqueryCmd.EncodeForPrinting(e)
@@ -593,7 +686,10 @@ class BigqueryCmd(NewCmd):
     elif isinstance(e, KeyboardInterrupt):
       response.append('')
     else:  # pylint:disable-msg=W0703
-      response.append(contact_us_msg)
+      # The traceback module has nicely formatted the error trace
+      # for us, so we don't want to undo that via TextWrap.
+      print flags.TextWrap(contact_us_msg)
+      print error_details
       response.append('Unexpected exception in %s operation: %s' % (
           name, message))
 
@@ -614,7 +710,7 @@ class _Load(BigqueryCmd):
     flags.DEFINE_string(
         'field_delimiter', None,
         'The character that indicates the boundary between columns in the '
-        'input file. "\t" and "tab" are accepted names for tab.',
+        'input file. "\\t" and "tab" are accepted names for tab.',
         short_name='F', flag_values=fv)
     flags.DEFINE_enum(
         'encoding', None,
@@ -685,13 +781,12 @@ class _Load(BigqueryCmd):
         'encoding': self.encoding,
         'skip_leading_rows': self.skip_leading_rows,
         'max_bad_records': self.max_bad_records,
+        'job_id': FLAGS.job_id,
         }
     if self.replace:
       opts['write_disposition'] = 'WRITE_TRUNCATE'
     if self.field_delimiter:
-      key = self.field_delimiter.lower()
-      opts['field_delimiter'] = _DELIMITER_MAP.get(
-          key, self.field_delimiter)
+      opts['field_delimiter'] = _NormalizeFieldDelimiter(self.field_delimiter)
 
     job = client.Load(table_reference, source, schema=schema, **opts)
     if not FLAGS.sync:
@@ -717,8 +812,12 @@ class _Query(BigqueryCmd):
     Usage:
       query <sql_query>
     """
+    kwds = {
+        'destination_table': self.destination_table,
+        'job_id': FLAGS.job_id,
+        }
     client = Client.Get()
-    job = client.Query(' '.join(args), destination_table=self.destination_table)
+    job = client.Query(' '.join(args), **kwds)
     if not FLAGS.sync:
       self.PrintJobStartInfo(job)
     else:
@@ -727,6 +826,14 @@ class _Query(BigqueryCmd):
 
 class _Extract(BigqueryCmd):
   usage = """extract <source_table> <destination_uri>"""
+
+  def __init__(self, name, fv):
+    super(_Extract, self).__init__(name, fv)
+    flags.DEFINE_string(
+        'field_delimiter', None,
+        'The character that indicates the boundary between columns in the '
+        'output file. "\\t" and "tab" are accepted names for tab.',
+        short_name='F', flag_values=fv)
 
   def RunWithArgs(self, source_table, destination_uri):
     """Perform an extract operation of source_table into destination_uri.
@@ -742,12 +849,13 @@ class _Extract(BigqueryCmd):
       destination_uri: Google Storage uri.
     """
     client = Client.Get()
+    kwds = {
+        'job_id': FLAGS.job_id,
+        }
     table_reference = client.GetTableReference(source_table)
-    extract_request = {'extract': {
-        'destinationUri': destination_uri,
-        'sourceTable': dict(table_reference)
-        }}
-    job = client.ExecuteJob(extract_request)
+    job = client.Extract(
+        table_reference, destination_uri,
+        field_delimiter=_NormalizeFieldDelimiter(self.field_delimiter), **kwds)
     if not FLAGS.sync:
       self.PrintJobStartInfo(job)
 
@@ -788,6 +896,7 @@ class _List(BigqueryCmd):
       bq ls -p -n 1000
       bq ls mydataset
     """
+    # pylint:disable-msg=C6115
     if self.j and self.p:
       raise app.UsageError(
           'Cannot specify more than one of -j and -p.')
@@ -889,6 +998,7 @@ class _Delete(BigqueryCmd):
     """
     client = Client.Get()
 
+    # pylint:disable-msg=C6115
     if self.d and self.t:
       raise app.UsageError('Cannot specify more than one of -d and -t.')
     if not identifier:
@@ -960,11 +1070,12 @@ class _Copy(BigqueryCmd):
           if 'y' != _PromptYN('cp: replace %r? (y/N) ' % (dest_reference,)):
             print 'NOT copying %r, exiting.' % (source_reference,)
             return 0
-
-    job = client.CopyTable(
-        source_reference, dest_reference,
-        write_disposition=write_disposition,
-        ignore_already_exists=ignore_already_exists)
+    kwds = {
+        'write_disposition': write_disposition,
+        'ignore_already_exists': ignore_already_exists,
+        'job_id': FLAGS.job_id,
+        }
+    job = client.CopyTable(source_reference, dest_reference, **kwds)
     if job is None:
       print "Table '%s' already exists, skipping" % (dest_reference,)
     elif not FLAGS.sync:
@@ -996,6 +1107,14 @@ class _Make(BigqueryCmd):
         'Either a filename or a comma-separated list of fields in the form '
         'name[:type].',
         flag_values=fv)
+    flags.DEFINE_string(
+        'description', None,
+        'Description of the dataset or table.',
+        flag_values=fv)
+    flags.DEFINE_integer(
+        'expiration', None,
+        'Expiration time, in seconds from now, of a table.',
+        flag_values=fv)
 
   def RunWithArgs(self, identifier='', schema=''):
     # pylint:disable-msg=C6115
@@ -1025,8 +1144,8 @@ class _Make(BigqueryCmd):
     if isinstance(reference, DatasetReference):
       if self.schema:
         raise app.UsageError('Cannot specify schema with a dataset.')
-
-    if isinstance(reference, DatasetReference):
+      if self.expiration:
+        raise app.UsageError('Cannot specify an expiration for a dataset.')
       if client.DatasetExists(reference):
         message = "Dataset '%s' already exists." % (reference,)
         if not self.f:
@@ -1034,7 +1153,8 @@ class _Make(BigqueryCmd):
         else:
           print message
           return
-      client.CreateDataset(reference, ignore_existing=True)
+      client.CreateDataset(reference, ignore_existing=True,
+                           description=self.description)
       print "Dataset '%s' successfully created." % (reference,)
     elif isinstance(reference, TableReference):
       if client.TableExists(reference):
@@ -1048,8 +1168,85 @@ class _Make(BigqueryCmd):
         schema = bigquery_client.BigqueryClient.ReadSchema(schema)
       else:
         schema = None
-      client.CreateTable(reference, ignore_existing=True, schema=schema)
+      expiration = None
+      if self.expiration:
+        expiration = int(self.expiration + time.time()) * 1000
+      client.CreateTable(reference, ignore_existing=True, schema=schema,
+                         description=self.description,
+                         expiration=expiration)
       print "Table '%s' successfully created." % (reference,)
+
+
+class _Update(BigqueryCmd):
+  usage = """update [-d] [-t] <identifier> [<schema>]"""
+
+  def __init__(self, name, fv):
+    super(_Update, self).__init__(name, fv)
+    flags.DEFINE_boolean(
+        'dataset', False,
+        'Updates a dataset with this name.',
+        short_name='d', flag_values=fv)
+    flags.DEFINE_boolean(
+        'table', False,
+        'Updates a table with this name.',
+        short_name='t', flag_values=fv)
+    flags.DEFINE_string(
+        'schema', '',
+        'Either a filename or a comma-separated list of fields in the form '
+        'name[:type].',
+        flag_values=fv)
+    flags.DEFINE_string(
+        'description', None,
+        'Description of the dataset or table.',
+        flag_values=fv)
+    flags.DEFINE_integer(
+        'expiration', None,
+        'Expiration time, in seconds from now, of a table.',
+        flag_values=fv)
+
+  def RunWithArgs(self, identifier='', schema=''):
+    # pylint:disable-msg=C6115
+    """Updates a dataset or table with this name.
+
+    See 'bq help load' for more information on specifying the schema.
+
+    Examples:
+      bq update --description "Dataset description" existing_dataset
+      bq update --description "My table" dataset.table
+      bq update -t new_dataset.newtable name:integer,value:string
+    """
+    client = Client.Get()
+
+    if self.d and self.t:
+      raise app.UsageError('Cannot specify both -d and -t.')
+
+    if self.t:
+      reference = client.GetTableReference(identifier)
+    elif self.d or not identifier:
+      reference = client.GetDatasetReference(identifier)
+    else:
+      reference = client.GetReference(identifier)
+      _Typecheck(reference, (DatasetReference, TableReference),
+                 "Invalid identifier '%s' for mk." % (identifier,))
+    if isinstance(reference, DatasetReference):
+      if self.schema:
+        raise app.UsageError('Cannot specify schema with a dataset.')
+      if self.expiration:
+        raise app.UsageError('Cannot specify an expiration for a dataset.')
+      client.UpdateDataset(reference, description=self.description)
+      print "Dataset '%s' successfully updated." % (reference,)
+    elif isinstance(reference, TableReference):
+      if schema:
+        schema = bigquery_client.BigqueryClient.ReadSchema(schema)
+      else:
+        schema = None
+      expiration = None
+      if self.expiration:
+        expiration = int(self.expiration + time.time()) * 1000
+      client.UpdateTable(reference, schema=schema,
+                         description=self.description,
+                         expiration=expiration)
+      print "Table '%s' successfully updated." % (reference,)
 
 
 class _Show(BigqueryCmd):
@@ -1063,7 +1260,7 @@ class _Show(BigqueryCmd):
         short_name='j', flag_values=fv)
     flags.DEFINE_boolean(
         'dataset', False,
-        'Create dataset with this name.',
+        'Show dataset with this name.',
         short_name='d', flag_values=fv)
 
   def RunWithArgs(self, identifier=''):
@@ -1074,6 +1271,7 @@ class _Show(BigqueryCmd):
       bq show dataset
       bq show dataset.table
     """
+    # pylint:disable-msg=C6115
     client = Client.Get()
     if self.j:
       project_id = client.GetProjectReference().projectId
@@ -1102,6 +1300,13 @@ class _Show(BigqueryCmd):
       print '%s %s\n' % (reference.typename.capitalize(), reference)
       formatter.Print()
       print
+      if (isinstance(reference, JobReference) and
+          object_info['State'] == 'FAILURE'):
+        error_result = object_info['status']['errorResult']
+        error_ls = object_info['status'].get('errors', [])
+        error = bigquery_client.BigqueryError.Create(
+            error_result, error_result, error_ls)
+        print 'Errors encountered during job execution. %s\n' % (error,)
     else:
       formatter = _GetFormatterFromFlags()
       formatter.AddColumns(object_info.keys())
@@ -1162,13 +1367,7 @@ class _Wait(BigqueryCmd):
 
     client = Client.Get()
     if not job_id:
-      # TODO(user): Fix this once a new version of apiclient
-      # This is a mild hack: there seems to be a bug in the discovery
-      # client involving repeated enum fields, so we make two calls.
-      # (Do not stare directly at the race condition, it may cause
-      # blindness.)
-      running_jobs = client.ListJobRefs(state_filter='PENDING')
-      running_jobs.extend(client.ListJobRefs(state_filter='RUNNING'))
+      running_jobs = client.ListJobRefs(state_filter=['PENDING', 'RUNNING'])
       if len(running_jobs) != 1:
         raise bigquery_client.BigqueryError(
             'No job_id provided, found %d running jobs' % (len(running_jobs),))
@@ -1355,9 +1554,34 @@ class _Init(BigqueryCmd):
   def __init__(self, name, fv):
     super(_Init, self).__init__(name, fv)
     self.surface_in_shell = False
+    flags.DEFINE_boolean(
+        'delete_credentials', None,
+        'If specified, the credentials file associated with this .bigqueryrc '
+        'file is deleted.',
+        flag_values=fv)
+
+  def DeleteCredentials(self):
+    """Deletes this user's credential file."""
+    _ProcessBigqueryrc()
+    filename = FLAGS.credential_file
+    if not os.path.exists(filename):
+      print 'Credential file %s does not exist.' % (filename,)
+      return 0
+    try:
+      if 'y' != _PromptYN('Delete credential file %s? (y/N) ' % (filename,)):
+        print 'NOT deleting %s, exiting.' % (filename,)
+        return 0
+      os.remove(filename)
+    except OSError, e:
+      print 'Error removing %s: %s' % (filename, e)
+      return 1
 
   def RunWithArgs(self):
     """Authenticate and create a default .bigqueryrc file."""
+    _ProcessBigqueryrc()
+    _SetupLoggerFromFlags()
+    if self.delete_credentials:
+      return self.DeleteCredentials()
     bigqueryrc = _GetBigqueryRcFilename()
     # Delete the old one, if it exists.
     print
@@ -1451,30 +1675,6 @@ class _Init(BigqueryCmd):
     return 0
 
 
-class _DeleteCredentials(BigqueryCmd):
-  """Deletes the credential file cached by "bq init"."""
-
-  def __init__(self, name, fv):
-    super(_DeleteCredentials, self).__init__(name, fv)
-    self.surface_in_shell = False
-
-  def RunWithArgs(self):
-    """Deletes this user's credential file."""
-    _ProcessBigqueryrc()
-    filename = FLAGS.credential_file
-    if not os.path.exists(filename):
-      print 'Credential file %s does not exist.' % (filename,)
-      return 0
-    try:
-      if 'y' != _PromptYN('Delete credential file %s? (y/N) ' % (filename,)):
-        print 'NOT deleting %s, exiting.' % (filename,)
-        return 0
-      os.remove(filename)
-    except OSError, e:
-      print 'Error removing %s: %s' % (filename, e)
-      return 1
-
-
 class _Version(BigqueryCmd):
   usage = """version"""
 
@@ -1498,8 +1698,6 @@ class _Version(BigqueryCmd):
 def main(argv):
   try:
     FLAGS.auth_local_webserver = False
-    _ProcessBigqueryrc()
-    _SetupLoggerFromFlags()
 
     appcommands.AddCmd('load', _Load)
     appcommands.AddCmd('query', _Query)
@@ -1511,20 +1709,19 @@ def main(argv):
     appcommands.AddCmd('head', _Head)
     appcommands.AddCmd('wait', _Wait)
     appcommands.AddCmd('cp', _Copy)
+    appcommands.AddCmd('update', _Update)
 
     appcommands.AddCmd('version', _Version)
     appcommands.AddCmd('shell', _Repl)
     appcommands.AddCmd('init', _Init)
-    appcommands.AddCmd('delete_credentials', _DeleteCredentials)
 
     if (not argv or
         (len(argv) > 1 and
-         argv[1] not in ['init', 'help', 'version', 'delete_credentials'] and
+         argv[1] not in ['init', 'help', 'version'] and
          argv[1] in appcommands.GetCommandList())):
       if not (os.path.exists(_GetBigqueryRcFilename()) or
               os.path.exists(FLAGS.credential_file)):
         appcommands.GetCommandByName('init').Run([])
-      Client.Get()
   except KeyboardInterrupt, e:
     print 'Control-C pressed, exiting.'
     sys.exit(1)

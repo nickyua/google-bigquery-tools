@@ -5,8 +5,8 @@
 
 
 
-from google.apputils import googletest
 
+from google.apputils import googletest
 import table_formatter
 
 
@@ -185,6 +185,24 @@ class PrettyFormatterTest(TableFormatterTest):
     self.assertRaises(table_formatter.FormatterException,
                       formatter.AddColumn, 'anything')
 
+  def testPrintEmptyTable(self):
+    formatter = table_formatter.PrettyFormatter(skip_header_when_empty=False)
+    formatter.AddColumns(('a', 'b'))
+    table_repr = '\n'.join((
+        '+---+---+',
+        '| a | b |',
+        '+---+---+',
+        '+---+---+'))
+    self.assertEquals(table_repr, str(formatter))
+
+    formatter = table_formatter.PrettyFormatter()
+    formatter.AddColumns(('a', 'b'))
+    self.assertEquals(table_repr, str(formatter))
+
+    formatter = table_formatter.PrettyFormatter(skip_header_when_empty=True)
+    formatter.AddColumns(('a', 'b'))
+    self.assertEquals('', str(formatter))
+
 
 class SparsePrettyFormatterTest(TableFormatterTest):
 
@@ -209,6 +227,24 @@ class SparsePrettyFormatterTest(TableFormatterTest):
          '                       efgh  ',
          ' -------------------- ------ '],
         list(formatter.FormatHeader()))
+
+  def testPrintEmptyTable(self):
+    formatter = table_formatter.SparsePrettyFormatter(
+        skip_header_when_empty=False)
+    formatter.AddColumns(('a', 'b'))
+    table_repr = '\n'.join((
+        '  a   b  ',
+        ' --- --- '))
+    self.assertEquals(table_repr, str(formatter))
+
+    formatter = table_formatter.SparsePrettyFormatter()
+    formatter.AddColumns(('a', 'b'))
+    self.assertEquals(table_repr, str(formatter))
+
+    formatter = table_formatter.SparsePrettyFormatter(
+        skip_header_when_empty=True)
+    formatter.AddColumns(('a', 'b'))
+    self.assertEquals('', str(formatter))
 
 
 class PrettyJsonFormatterTest(TableFormatterTest):

@@ -83,10 +83,18 @@ class FormatterException(Exception):
 class TableFormatter(object):
   """Interface for table formatters."""
 
-  def __init__(self):
+  def __init__(self, **kwds):
+    """Initializes the base class.
+
+    Keyword arguments:
+      skip_header_when_empty: If true, does not print the table's header
+        if there are zero rows. This argument has no effect on
+        PrettyJsonFormatter.
+    """
     if self.__class__ == TableFormatter:
       raise NotImplementedError(
           'Cannot instantiate abstract class TableFormatter')
+    self.skip_header_when_empty = kwds.get('skip_header_when_empty', False)
 
   def __nonzero__(self):
     return bool(len(self))
@@ -153,7 +161,7 @@ class PrettyFormatter(TableFormatter):
       horizontal_char: (default: -) Character to use for horizontal lines.
       vertical_char: (default: |) Character to use for vertical lines.
     """
-    super(PrettyFormatter, self).__init__()
+    super(PrettyFormatter, self).__init__(**kwds)
 
     self.junction_char = kwds.get('junction_char', '+')
     self.horizontal_char = kwds.get('horizontal_char', '-')
@@ -170,7 +178,7 @@ class PrettyFormatter(TableFormatter):
     return len(self.rows)
 
   def __str__(self):
-    if self:
+    if self or not self.skip_header_when_empty:
       lines = itertools.chain(
           self.FormatHeader(), self.FormatRows(), self.FormatHrule())
     else:
@@ -387,13 +395,15 @@ class PrettyFormatter(TableFormatter):
 class SparsePrettyFormatter(PrettyFormatter):
   """Formats output as a table with a header and separator line."""
 
-  def __init__(self):
-    super(SparsePrettyFormatter, self).__init__()
-    self.junction_char = ' '
-    self.vertical_char = ' '
+  def __init__(self, **kwds):
+    """Initialize a new SparsePrettyFormatter."""
+    default_kwds = {'junction_char': ' ',
+                    'vertical_char': ' '}
+    default_kwds.update(kwds)
+    super(SparsePrettyFormatter, self).__init__(**default_kwds)
 
   def __str__(self):
-    if self:
+    if self or not self.skip_header_when_empty:
       lines = itertools.chain(self.FormatHeader(), self.FormatRows())
     else:
       lines = []
@@ -412,8 +422,8 @@ class CsvFormatter(TableFormatter):
   those that contain quotes, newlines, or commas.
   """
 
-  def __init__(self):
-    super(CsvFormatter, self).__init__()
+  def __init__(self, **kwds):
+    super(CsvFormatter, self).__init__(**kwds)
     self._buffer = cStringIO.StringIO()
     self._header = []
     self._table = csv.writer(
@@ -426,7 +436,11 @@ class CsvFormatter(TableFormatter):
     return len(unicode(self).splitlines())
 
   def __str__(self):
-    return '\n'.join([','.join(self._header), self._buffer.getvalue()]).rstrip()
+    if self or not self.skip_header_when_empty:
+      lines = [','.join(self._header), self._buffer.getvalue()]
+    else:
+      lines = []
+    return '\n'.join(lines).rstrip()
 
   @property
   def column_names(self):
@@ -448,8 +462,8 @@ class CsvFormatter(TableFormatter):
 class JsonFormatter(TableFormatter):
   """Formats output in maximally compact JSON."""
 
-  def __init__(self):
-    super(JsonFormatter, self).__init__()
+  def __init__(self, **kwds):
+    super(JsonFormatter, self).__init__(**kwds)
     self._field_names = []
     self._table = []
 
@@ -485,8 +499,8 @@ class PrettyJsonFormatter(JsonFormatter):
 class NullFormatter(TableFormatter):
   """Formatter that prints no output at all."""
 
-  def __init__(self):
-    super(NullFormatter, self).__init__()
+  def __init__(self, **kwds):
+    super(NullFormatter, self).__init__(**kwds)
     self._column_names = []
     self._rows = []
 
