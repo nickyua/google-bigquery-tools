@@ -119,15 +119,15 @@ flags.DEFINE_multistring(
     'Additional key-value pairs to include in the properties field of '
     'the job configuration')  # No period: Multistring adds flagspec suffix.
 flags.DEFINE_string(
-    'robot', '',
+    'service_account', '',
     'Use this service account email address for authorization. '
     'For example, 1234567890@developer.gserviceaccount.com')
 flags.DEFINE_string(
-    'robot_private_key_file', '',
+    'service_account_private_key_file', '',
     'Filename that contains the service account private key. '
-    'Required if --robot is specified.')
+    'Required if --service_account is specified.')
 flags.DEFINE_string(
-    'robot_private_key_password', 'notasecret',
+    'service_account_private_key_password', 'notasecret',
     'Password for private key. This password must match the password '
     'you set on the key when you created it in the Google APIs Console. '
     'Defaults to the default Google APIs Console private key password.')
@@ -246,28 +246,28 @@ def _ResolveApiInfoFromFlags():
   return {'api': api, 'api_version': api_version}
 
 
-def _GetRobotCredentialsFromFlags():
-  try:
-    with file(FLAGS.robot_private_key_file, 'rb') as f:
-      key = f.read()
-  except IOError as e:
-    raise app.UsageError(
-        'Service account specified, but private key in file "%s" '
-        'cannot be read:\n%s' % (FLAGS.robot_private_key_file, e))
+def _GetServiceAccountCredentialsFromFlags():
   if not oauth2client.client.HAS_OPENSSL:
     raise app.UsageError(
         'BigQuery requires OpenSSL to be installed in order to use '
         'service account credentials. Please install OpenSSL '
         'and the Python OpenSSL package.')
+  try:
+    with file(FLAGS.service_account_private_key_file, 'rb') as f:
+      key = f.read()
+  except IOError as e:
+    raise app.UsageError(
+        'Service account specified, but private key in file "%s" '
+        'cannot be read:\n%s' % (FLAGS.service_account_private_key_file, e))
   return oauth2client.client.SignedJwtAssertionCredentials(
-      FLAGS.robot, key, _CLIENT_SCOPE,
-      private_key_password=FLAGS.robot_private_key_password,
+      FLAGS.service_account, key, _CLIENT_SCOPE,
+      private_key_password=FLAGS.service_account_private_key_password,
       user_agent=_CLIENT_USER_AGENT)
 
 
 def _GetCredentialsFromFlags():
-  if FLAGS.robot:
-    return _GetRobotCredentialsFromFlags()
+  if FLAGS.service_account:
+    return _GetServiceAccountCredentialsFromFlags()
 
   intended_perms = stat.S_IWUSR | stat.S_IRUSR
   if not os.path.exists(FLAGS.credential_file):
@@ -1719,9 +1719,12 @@ def main(argv):
         (len(argv) > 1 and
          argv[1] not in ['init', 'help', 'version'] and
          argv[1] in appcommands.GetCommandList())):
-      if not (os.path.exists(_GetBigqueryRcFilename()) or
-              os.path.exists(FLAGS.credential_file)):
-        appcommands.GetCommandByName('init').Run([])
+      # Service Accounts don't use cached oauth credentials and
+      # all bigqueryrc defaults are technically optional.
+      if not FLAGS.service_account:
+        if not (os.path.exists(_GetBigqueryRcFilename()) or
+                os.path.exists(FLAGS.credential_file)):
+          appcommands.GetCommandByName('init').Run([])
   except KeyboardInterrupt, e:
     print 'Control-C pressed, exiting.'
     sys.exit(1)
