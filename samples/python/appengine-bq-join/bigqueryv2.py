@@ -1,129 +1,138 @@
-#!/usr/bin/env python
-#
-# Copyright 2011 Google Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright 2012 Google Inc. All Rights Reserved.
 
 """Library to make BigQuery v2 client requests."""
 
-__author__ = 'Donn Denman'
-__version__ = '0.0a1.dev1'
+__author__ = 'kbrisbin@google.com (Kathryn Hurley)'
 
+import cgi
+import errors
 import logging
-import os
+from apiclient.discovery import build
+from apiclient.errors import HttpError
 
-from apiclient import discovery
-from google.appengine.api import memcache
-import httplib2
-from oauth2client.client import Credentials
+TIMEOUT_MS = 1000
+BIGQUERY_API_VERSION = 'v2'
 
-# Defaults
-_TIMEOUT_MS = 100000
-_BIGQUERY_API_VERSION = 'v2'
-
-class BigQueryClientException(Exception):
-  pass
 
 class BigQueryClient(object):
-    """BigQuery version 2 client.
+  """BigQuery version 2 client."""
+
+  def __init__(self, project_id, api_version=BIGQUERY_API_VERSION):
+    """Creates the BigQuery client connection.
 
     Args:
-        cleanhttp: an undecorated httplib2 object.
-        projectID: either the numeric ID or your registered ID.
-            This defines the project to receive the bill for query usage.
-        api_version: version of BigQuery API to construct.
+      project_id: either the numeric ID or your registered ID.
+          This defines the project to receive the bill for query usage.
+      api_version: version of BigQuery API to construct.
     """
+    self.service = build('bigquery', api_version)
+    self.project_id = project_id
 
-    def __init__(self, cleanhttp, projectID=False,
-               api_version=_BIGQUERY_API_VERSION):
-        """Creates the BigQuery client connection"""
-        self.service = discovery.build('bigquery', api_version, http=cleanhttp)
-        self.defaultProject = projectID
+  def query(self, authorized_http, query):
+    """Issues an synchronous query to bigquery v2.
 
-    def Query(self, decoratedhttp, query, project_id=False, timeout_ms=_TIMEOUT_MS):
-        """Issues a synchronous query to bigquery v2.
-
-        Args:
-            decoratedhttp: [required] httplib2 object wrapped by
-                oauth2client.appengine decorator.
-            query: [required] String of SQL query to run.
-            project_id: project to bill for query.
-        """
-        query_config = {
-            'query': query,
-            'timeoutMs': timeout_ms
+    Args:
+      authorized_http: the authorized Http instance.
+      query: string SQL query to run.
+    Returns:
+      The string job reference.
+    Raises:
+      QueryError if the query fails.
+    """
+    logging.info(query)
+    job_collection = self.service.jobs()
+    job_data = {
+        'projectId': self.project_id,
+        'configuration': {
+            'query': {
+                'query': query
+            }
+          }
         }
-        if not project_id:
-            project_id = self.defaultProject
+    request = job_collection.insert(
+        projectId=self.project_id,
+        body=job_data)
+    try:
+      response = request.execute(authorized_http)
+    except HttpError:
+      raise errors.QueryError
+    return response['jobReference']['jobId']
 
-        logging.info('Query: %s', query)
-        result_json = (self.service.jobs()
-                       .query(projectId=project_id, body=query_config)
-                       .execute(decoratedhttp))
-        total_rows = result_json['totalRows']
-        logging.info('Query result total_rows: %s', total_rows)
+  def poll(self, authorized_http, job_id, timeout_ms=TIMEOUT_MS):
+    """Polls the job to get results.
 
-        schema = self.Schema(result_json['schema'])
-        result_rows = []
-        if 'rows' in result_json:
-            for row in result_json['rows']:
-                result_rows.append(schema.ConvertRow(row))
-                logging.info('Returning %d rows.', len(result_rows))
-        return {'rows':result_rows, 'schema':schema, 'query':query}
+    Args:
+      authorized_http: the authorized Http instance.
+      job_id: the running job.
+      timeout_ms: the number of milliseconds to wait for results.
+    Returns:
+      The job results.
+    Raises:
+      PollError when the poll fails.
+    """
+    job_collection = self.service.jobs()
+    request = job_collection.getQueryResults(
+        projectId=self.project_id,
+        jobId=job_id,
+        timeoutMs=timeout_ms)
+    try:
+      response = request.execute(authorized_http)
+    except HttpError, err:
+      logging.error(cgi.escape(err._get_reason()))
+      raise errors.PollError
 
-    class Schema(object):
-        """Does schema-based type conversion of result data."""
+    if 'jobComplete' in response:
+      complete = response['jobComplete']
+      if complete:
+        rows = response['rows']
+        schema = response['schema']
+        converter = self.Converter(schema)
+        formatted_rows = []
+        for row in rows:
+          formatted_rows.append(converter.convert_row(row))
+        response['formattedRows'] = formatted_rows
+    return response
 
-        def __init__(self, schema_row):
-            """Sets up the schema converter.
+  class Converter(object):
+    """Does schema-based type conversion of result data."""
 
-            Args:
-              schema_row: a dict containing BigQuery schema definitions, ala
-            {'fields': [{'type': 'FLOAT', 'name': 'field', 'mode': 'REQUIRED'},
-                        {'type': 'INTEGER', 'name': 'climate_bin'}]}
-            """
-            self.schema = []
-            for field in schema_row['fields']:
-                self.schema.append(field['type'])
+    def __init__(self, schema_row):
+      """Sets up the schema converter.
 
-        def ConvertRow(self, row):
-            """Converts a row of data into a tuple with type conversion applied.
+      Args:
+        schema_row: a dict containing BigQuery schema definitions.
+      """
+      self.schema = []
+      for field in schema_row['fields']:
+        self.schema.append(field['type'])
 
-            Args:
-              row: a row of BigQuery data, ala
-                  {'f': [{'v': 665.60329999999999}, {'v': '1'}]}
-            Returns:
-              a tuple with the converted data values for the row.
-            """
-            i = 0
-            data = []
-            for entry in row['f']:
-                data.append(self.Convert(entry['v'], self.schema[i]))
-                i += 1
-            return tuple(data)
+    def convert_row(self, row):
+      """Converts a row of data into a tuple with type conversion applied.
 
-        def Convert(self, entry, schema_type):
-          """Converts an entry based on the schema type given.
+      Args:
+        row: a row of BigQuery data.
+      Returns:
+        A tuple with the converted data values for the row.
+      """
+      i = 0
+      data = []
+      for entry in row['f']:
+        data.append(self.convert(entry['v'], self.schema[i]))
+        i += 1
+      return tuple(data)
 
-          Args:
-            entry: the data entry to convert.
-            schema_type: appropriate type for the entry.
-          Returns:
-            the data entry, either as passed in, or converted to the given type.
-          """
-          if schema_type == u'FLOAT' and entry is not None:
-            return float(entry)
-          elif schema_type == u'INTEGER' and entry is not None:
-            return int(entry)
-          else:
-            return entry
+    def convert(self, entry, schema_type):
+      """Converts an entry based on the schema type given.
+
+      Args:
+        entry: the data entry to convert.
+        schema_type: appropriate type for the entry.
+      Returns:
+        The data entry, either as passed in, or converted to the given type.
+      """
+      if schema_type == u'FLOAT' and entry is not None:
+        return float(entry)
+      elif schema_type == u'INTEGER' and entry is not None:
+        return int(entry)
+      else:
+        return entry

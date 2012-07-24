@@ -1,14 +1,10 @@
-App Engine Sample Featuring BigQuery Joins
+App Engine Sample Featuring BigQuery
 
 INSTALLATION:
 Follow the instructions for enable-app-engine-project
 here to add the required libraries:
    http://code.google.com/p/google-api-python-client/wiki/GoogleAppEngine
 
-Replace 'MAKE_THIS_YOURS' with the appropriate information in
+Replace the info in square brackets with your info in
    client_secrets.json
    main.py
-
-For more specific building information and documentation on the sample,
-see
-   http://code.google.com/p/google-bigquery-tools/wiki/PythonAppEngineSample

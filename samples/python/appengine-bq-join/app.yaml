@@ -1,12 +1,15 @@
 application: appengine-bq-join
 version: 1
-runtime: python
+runtime: python27
 api_version: 1
+threadsafe: false
 
 handlers:
+- url: /js
+  static_dir: js
+
 - url: /oauth2callback
   script: oauth2client/appengine.py
 
 - url: .*
-  script: main.py
-
+  script: main.app
