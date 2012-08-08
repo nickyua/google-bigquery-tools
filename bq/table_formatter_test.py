@@ -1,5 +1,19 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
+# -*- coding: utf-8 -*-
+#
+# Copyright 2012 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Tests for table_formatter.py."""
 
@@ -26,6 +40,23 @@ class TableFormatterTest(googletest.TestCase):
   def testStr(self):
     self.failIf(hasattr(self, 'format_class'),
                 'Subclasses must override testStr')
+
+  def testUnicodeRow(self):
+    row = [11, 'chinese', u'你不能教老狗新把戏']
+    if type(self) != TableFormatterTest:
+      formatter = self.format_class()
+      formatter.AddColumns(('count', 'language', 'message'))
+      formatter.AddRow(row)
+      # Note that we don't need any asserts here: the act of calling
+      # Print will throw if unicode isn't being handled correctly.
+      formatter.Print()
+
+      formatter = self.format_class()
+      formatter.AddColumns(('message',))
+      formatter.AddRow(row[2:])
+      formatter.Print()
+      self.assertTrue(all(ord(c) <= 127 for c in str(formatter)))
+      self.assertTrue(any(ord(c) > 127 for c in unicode(formatter)))
 
 
 class PrettyFormatterTest(TableFormatterTest):
@@ -302,6 +333,9 @@ class NullFormatterTest(TableFormatterTest):
 
   def testStr(self):
     self.assertEquals('', str(self.formatter))
+
+  def testUnicodeRow(self):
+    self.assertEquals('', unicode(self.formatter))
 
 
 if __name__ == '__main__':

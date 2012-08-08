@@ -101,6 +101,9 @@ class BigqueryClientTest(googletest.TestCase):
     self.assertRaises(bigquery_client.BigquerySchemaError,
                       bigquery_client.BigqueryClient.ReadSchema,
                       'foo:int,,bar:string')
+    self.assertRaises(bigquery_client.BigquerySchemaError,
+                      bigquery_client.BigqueryClient.ReadSchema,
+                      '../foo/bar/fake_filename')
 
   def testParseIdentifier(self):
     for identifier, parse in self.parse_tests.iteritems():

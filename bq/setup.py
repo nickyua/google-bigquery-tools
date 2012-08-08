@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2011 Google Inc.
+# Copyright 2012 Google Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ez_setup import use_setuptools
-use_setuptools()
-from setuptools import setup
+"""Setup configuration."""
 
 import platform
 
+from ez_setup import use_setuptools
+use_setuptools()
+from setuptools import setup  # pylint:disable-msg=C6204
+
 # Configure the required packages and scripts to install, depending on
-# Python version and OS
+# Python version and OS.
 REQUIRED_PACKAGES = [
     'google-apputils',
     'python-gflags',
@@ -40,7 +42,7 @@ py_version = platform.python_version()
 if py_version < '2.6.5' or py_version >= '3':
   raise ValueError('BigQuery requires Python >= 2.6.5.')
 
-_BQ_VERSION = '2.0.6'
+_BQ_VERSION = '2.0.7'
 
 setup(name='bigquery',
       version=_BQ_VERSION,
@@ -51,6 +53,11 @@ setup(name='bigquery',
           'bigquery_client',
           'table_formatter',
           ],
+      include_package_data=True,
+      packages=['discovery'],
+      package_data={
+          'discovery': ['*'],
+          },
       entry_points={
           'console_scripts': CONSOLE_SCRIPTS,
           },

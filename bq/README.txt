@@ -23,7 +23,7 @@ Installing and running bq
    a) easy_install
 
    To install via easy_install, just type:
-     easy_install bigquery.tar
+     easy_install bigquery
 
    You can also directly install bq from:
      easy_install http://code.google.com/p/google-bigquery-tools/downloads/list/bigquery-x.y.z.tar [--script_dir target_installation_directory]
@@ -36,7 +36,7 @@ Installing and running bq
           tar -zxvf bigquery-x.y.z.tar
 
      2. Change to the bq directory:
-          cd bq
+          cd bigquery-x.y.z
 
      3. Run the install script:
           python setup.py install [--install-scripts=target_installation_directory]

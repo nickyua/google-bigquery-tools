@@ -10,6 +10,7 @@ import itertools
 import json
 import logging
 import os
+import pkgutil
 import re
 import sys
 import textwrap
@@ -21,6 +22,13 @@ from apiclient import discovery
 from apiclient import http as http_request
 from apiclient import model
 import httplib2
+
+# To configure apiclient logging.
+import gflags as flags
+
+# A unique non-None default, for use in kwargs that need to
+# distinguish default from None.
+_DEFAULT = object()
 
 
 def _Typecheck(obj, types, message=None, method=None):
@@ -43,10 +51,38 @@ def _ApplyParameters(config, **kwds):
   config.update((_ToLowerCamel(k), v) for k, v in kwds.iteritems() if v)
 
 
+def ConfigurePythonLogger(apilog=None):
+  """Sets up Python logger, which BigqueryClient logs with.
+
+  Applications can configure logging however they want, but this
+  captures one pattern of logging which seems useful when dealing with
+  a single command line option for determining logging.
+
+  Args:
+    apilog: To log to sys.stdout, specify '', '-', '1', 'true', or
+      'stdout'. To log to sys.stderr, specify 'stderr'. To log to a
+      file, specify the file path. Specify None to disable logging.
+  """
+  if apilog is None:
+    # Effectively turn off logging.
+    logging.disable(logging.CRITICAL)
+  else:
+    if apilog in ('', '-', '1', 'true', 'stdout'):
+      logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    elif apilog == 'stderr':
+      logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+    elif apilog:
+      logging.basicConfig(filename=apilog, level=logging.INFO)
+    else:
+      logging.basicConfig(level=logging.INFO)
+    # Turn on apiclient logging of http requests and responses.
+    flags.FLAGS.dump_request_response = True
+
+
 class BigqueryError(Exception):
 
   @staticmethod
-  def Create(error, server_error, error_ls):
+  def Create(error, server_error, error_ls, job_ref=None):
     """Returns a BigqueryError for json error embedded in server_error.
 
     If error_ls contains any errors other than the given one, those
@@ -57,12 +93,16 @@ class BigqueryError(Exception):
       server_error: The error returned by the server. (This is only used
         in the case that error is malformed.)
       error_ls: Additional errors to include in the error message.
+      job_ref: JobReference, if this is an error associated with a job.
 
     Returns:
       BigqueryError representing error.
     """
     reason = error.get('reason')
-    message = error.get('message')
+    if job_ref:
+      message = 'Error processing %r: %s' % (job_ref, error.get('message'))
+    else:
+      message = error.get('message')
     # We don't want to repeat the "main" error message.
     new_errors = [err for err in error_ls if err != error]
     if new_errors:
@@ -77,17 +117,20 @@ class BigqueryError(Exception):
           'Error reported by server with missing error fields. '
           'Server returned: %s' % (str(server_error),))
     if reason == 'notFound':
-      return BigqueryNotFoundError(message)
+      return BigqueryNotFoundError(message, error, error_ls, job_ref=job_ref)
     if reason == 'duplicate':
-      return BigqueryDuplicateError(message)
+      return BigqueryDuplicateError(message, error, error_ls, job_ref=job_ref)
     if reason == 'accessDenied':
-      return BigqueryAccessDeniedError(message)
+      return BigqueryAccessDeniedError(
+          message, error, error_ls, job_ref=job_ref)
     if reason == 'invalidQuery':
-      return BigqueryInvalidQueryError(message)
+      return BigqueryInvalidQueryError(
+          message, error, error_ls, job_ref=job_ref)
     if reason == 'termsOfServiceNotAccepted':
-      return BigqueryTermsOfServiceError(message)
+      return BigqueryTermsOfServiceError(
+          message, error, error_ls, job_ref=job_ref)
     # We map the less interesting errors to BigqueryServiceError.
-    return BigqueryServiceError(message)
+    return BigqueryServiceError(message, error, error_ls, job_ref=job_ref)
 
 
 class BigqueryCommunicationError(BigqueryError):
@@ -105,7 +148,28 @@ class BigqueryServiceError(BigqueryError):
 
   The BigQuery server received request and returned an error.
   """
-  pass
+
+  def __init__(self, message, error, error_list, job_ref=None,
+               *args, **kwds):
+    """Initializes a BigqueryServiceError.
+
+    Args:
+      message: A user-facing error message.
+      error: The error dictionary, code may inspect the 'reason' key.
+      error_list: A list of additional entries, for example a load job
+        may contain multiple errors here for each error encountered
+        during processing.
+      job_ref: Optional JobReference, if this error was encountered
+        while processing a job.
+    """
+    super(BigqueryServiceError, self).__init__(message, *args, **kwds)
+    self.error = error
+    self.error_list = error_list
+    self.job_ref = job_ref
+
+  def __repr__(self):
+    return '%s: error=%s, error_list=%s, job_ref=%s' % (
+        self.__class__.__name__, self.error, self.error_list, self.job_ref)
 
 
 class BigqueryNotFoundError(BigqueryServiceError):
@@ -174,6 +238,8 @@ class BigqueryHttp(http_request.HttpRequest):
 
   @staticmethod
   def Factory(bigquery_model):
+    """Returns a function that creates a BigqueryHttp with the given model."""
+
     def _Construct(*args, **kwds):
       captured_model = bigquery_model
       return BigqueryHttp(captured_model, *args, **kwds)
@@ -212,8 +278,9 @@ class BigqueryClient(object):
         BigqueryClientConfigurationError if no project_id can be
         found.
       dataset_id: a default dataset id to use.
-      discovery_document: the discovery document to use. If not
-        specified, one will be retrieved from the discovery api.
+      discovery_document: the discovery document to use. If None, one
+        will be retrieved from the discovery api. If not specified,
+        the built-in discovery document will be used.
       job_property: a list of "key=value" strings defining properties
         to apply to all job operations.
       trace: a tracing header to inclue in all bigquery api requests.
@@ -235,10 +302,10 @@ class BigqueryClient(object):
     default_flag_values = {
         'project_id': '',
         'dataset_id': '',
-        'discovery_document': None,
+        'discovery_document': _DEFAULT,
         'job_property': '',
         'trace': None,
-        'sync': False,
+        'sync': True,
         'wait_printer_factory': BigqueryClient.TransitionWaitPrinter,
         }
     for flagname, default in default_flag_values.iteritems():
@@ -253,8 +320,18 @@ class BigqueryClient(object):
     if self._apiclient is None:
       http = self.credentials.authorize(httplib2.Http())
       bigquery_model = BigqueryModel(self.trace)
-      bigquery_http = BigqueryHttp.Factory(bigquery_model)
-      if self.discovery_document is None:
+      bigquery_http = BigqueryHttp.Factory(
+          bigquery_model)
+      discovery_document = self.discovery_document
+      if discovery_document == _DEFAULT:
+        # Use the api description packed with this client, if one exists.
+        try:
+          discovery_document = pkgutil.get_data(
+              'bigquery_client', 'discovery/bigquery.%s.rest.json'
+              % (self.api_version,))
+        except IOError:
+          discovery_document = None
+      if discovery_document is None:
         discovery_url = '%s/discovery/v1/apis/{api}/{apiVersion}/rest' % (
             self.api,)
         try:
@@ -273,7 +350,7 @@ class BigqueryClient(object):
               'Invalid API name or version: %s' % (str(e),))
       else:
         self._apiclient = discovery.build_from_document(
-            self.discovery_document, self.api, http=http,
+            discovery_document, self.api, http=http,
             model=bigquery_model,
             requestBuilder=bigquery_http)
     return self._apiclient
@@ -620,7 +697,9 @@ class BigqueryClient(object):
     if BigqueryClient.IsFailedJob(job):
       error = job['status']['errorResult']
       error_ls = job['status'].get('errors', [])
-      raise BigqueryError.Create(error, error, error_ls)
+      raise BigqueryError.Create(
+          error, error, error_ls,
+          job_ref=BigqueryClient.ConstructObjectReference(job))
     return job
 
   @staticmethod
@@ -708,6 +787,13 @@ class BigqueryClient(object):
               ('Error decoding JSON schema from file %s: %s\n'
                'To specify a one-column schema, use "name:string".') % (
                    schema, e))
+    elif re.match(r'[./\\]', schema) is not None:
+      # We have something that looks like a filename, but we didn't
+      # find it. Tell the user about the problem now, rather than wait
+      # for a round-trip to the server.
+      raise BigquerySchemaError(
+          ('Error reading schema: "%s" looks like a filename, '
+           'but was not found.') % (schema,))
     else:
       return [NewField(entry) for entry in schema.split(',')]
 
@@ -996,7 +1082,7 @@ class BigqueryClient(object):
       return False
 
   def CreateDataset(self, reference, ignore_existing=False, description=None,
-                    friendly_name=None):
+                    friendly_name=None, acl=None):
     """Create a dataset corresponding to DatasetReference.
 
     Args:
@@ -1005,6 +1091,7 @@ class BigqueryClient(object):
         an exception if the dataset already exists.
       description: an optional dataset description.
       friendly_name: an optional friendly name for the dataset.
+      acl: an optional ACL for the dataset, as a list of dicts.
 
     Raises:
       TypeError: if reference is not a DatasetReference.
@@ -1019,6 +1106,8 @@ class BigqueryClient(object):
       body['friendlyName'] = friendly_name
     if description is not None:
       body['description'] = description
+    if acl is not None:
+      body['access'] = acl
     try:
       self.apiclient.datasets().insert(
           body=body,
@@ -1093,13 +1182,14 @@ class BigqueryClient(object):
     self.apiclient.tables().patch(body=body, **dict(reference)).execute()
 
   def UpdateDataset(self, reference,
-                    description=None, friendly_name=None):
+                    description=None, friendly_name=None, acl=None):
     """Updates a dataset.
 
     Args:
       reference: the DatasetReference to update.
-      description: an optional table description.
+      description: an optional dataset description.
       friendly_name: an optional friendly name for the dataset.
+      acl: an optional ACL for the dataset, as a list of dicts.
 
     Raises:
       TypeError: if reference is not a DatasetReference.
@@ -1112,6 +1202,8 @@ class BigqueryClient(object):
       body['friendlyName'] = friendly_name
     if description is not None:
       body['description'] = description
+    if acl is not None:
+      body['access'] = acl
 
     self.apiclient.datasets().patch(body=body, **dict(reference)).execute()
 
@@ -1386,7 +1478,8 @@ class BigqueryClient(object):
     return self.ReadTableRows(job['configuration']['query']['destinationTable'])
 
   def Query(self, query, destination_table=None,
-            create_disposition=None, write_disposition=None, **kwds):
+            create_disposition=None, write_disposition=None,
+            priority=None, **kwds):
     """Execute the given query, returning the created job.
 
     The job will execute synchronously if sync=True is provided as an
@@ -1400,6 +1493,8 @@ class BigqueryClient(object):
           the destination_table.
       write_disposition: Optional. Specifies the write_disposition for
           the destination_table.
+      priority: Optional. Priority to run the query with. Either
+          'INTERACTIVE' (default) or 'BATCH'.
       **kwds: Passed on to self.ExecuteJob.
 
     Raises:
@@ -1420,6 +1515,8 @@ class BigqueryClient(object):
         raise BigqueryError('Invalid value %s for destination_table: %s' % (
             destination_table, e))
       query_config['destinationTable'] = dict(reference)
+    if priority is not None:
+      query_config['priority'] = priority
     _ApplyParameters(
         query_config, create_disposition=create_disposition,
         write_disposition=write_disposition)

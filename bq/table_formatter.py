@@ -1,5 +1,17 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
+# Copyright 2012 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Table formatting library.
 
@@ -64,7 +76,7 @@ Machine Consumption
 
 Additional formatters can be added by subclassing TableFormatter and
 overriding the following methods:
-  __len__, __str__, AddRow, column_names, AddColumn
+  __len__, __unicode__, AddRow, column_names, AddColumn
 """
 
 
@@ -103,11 +115,16 @@ class TableFormatter(object):
     raise NotImplementedError('__len__ must be implemented by subclass')
 
   def __str__(self):
-    raise NotImplementedError('__str__ must be implemented by subclass')
+    return unicode(self).encode(sys.getdefaultencoding(), 'backslashreplace')
+
+  def __unicode__(self):
+    raise NotImplementedError('__unicode__ must be implemented by subclass')
 
   def Print(self):
     if self:
-      encoding = sys.stdout.encoding or 'ascii'
+      # TODO(user): Make encoding a customizable attribute on
+      # the TableFormatter.
+      encoding = sys.stdout.encoding or 'utf8'
       print unicode(self).encode(encoding, 'backslashreplace')
 
   def AddRow(self, row):
@@ -177,7 +194,7 @@ class PrettyFormatter(TableFormatter):
   def __len__(self):
     return len(self.rows)
 
-  def __str__(self):
+  def __unicode__(self):
     if self or not self.skip_header_when_empty:
       lines = itertools.chain(
           self.FormatHeader(), self.FormatRows(), self.FormatHrule())
@@ -286,7 +303,7 @@ class PrettyFormatter(TableFormatter):
             cell_width, len(line))
         content_lines.append(' %s%s%s ' % (
             ' ' * left_padding, line, ' ' * right_padding))
-      elif align in ['l', 'r']:
+      elif align in ('l', 'r'):
         fmt = ' %*s ' if align == 'r' else ' %-*s '
         content_lines.append(fmt % (cell_width, line))
       else:
@@ -379,7 +396,7 @@ class PrettyFormatter(TableFormatter):
     if self:
       raise FormatterException(
           'Cannot add a new column to an initialized table')
-    if align not in ['l', 'c', 'r']:
+    if align not in ('l', 'c', 'r'):
       raise FormatterException('Invalid column alignment: %s' % (align,))
     lines = column_name.split('\n')
     self.column_widths.append(max(len(line) for line in lines))
@@ -402,7 +419,7 @@ class SparsePrettyFormatter(PrettyFormatter):
     default_kwds.update(kwds)
     super(SparsePrettyFormatter, self).__init__(**default_kwds)
 
-  def __str__(self):
+  def __unicode__(self):
     if self or not self.skip_header_when_empty:
       lines = itertools.chain(self.FormatHeader(), self.FormatRows())
     else:
@@ -435,12 +452,14 @@ class CsvFormatter(TableFormatter):
   def __len__(self):
     return len(unicode(self).splitlines())
 
-  def __str__(self):
+  def __unicode__(self):
     if self or not self.skip_header_when_empty:
       lines = [','.join(self._header), self._buffer.getvalue()]
     else:
       lines = []
-    return '\n'.join(lines).rstrip()
+    # Note that we need to explicitly decode here to work around
+    # the fact that the CSV module does not work with unicode.
+    return '\n'.join(line.decode('utf8') for line in lines).rstrip()
 
   @property
   def column_names(self):
@@ -453,10 +472,8 @@ class CsvFormatter(TableFormatter):
     self._header.append(column_name)
 
   def AddRow(self, row):
-    self._table.writerow(row)
-
-  def AddRows(self, rows):
-    self._table.writerows(rows)
+    self._table.writerow([unicode(entry).encode('utf8', 'backslashreplace')
+                          for entry in row])
 
 
 class JsonFormatter(TableFormatter):
@@ -470,8 +487,8 @@ class JsonFormatter(TableFormatter):
   def __len__(self):
     return len(self._table)
 
-  def __str__(self):
-    return json.dumps(self._table, separators=(',', ':'))
+  def __unicode__(self):
+    return json.dumps(self._table, separators=(',', ':'), ensure_ascii=False)
 
   @property
   def column_names(self):
@@ -492,8 +509,8 @@ class JsonFormatter(TableFormatter):
 class PrettyJsonFormatter(JsonFormatter):
   """Formats output in human-legible JSON."""
 
-  def __str__(self):
-    return json.dumps(self._table, sort_keys=True, indent=2)
+  def __unicode__(self):
+    return json.dumps(self._table, sort_keys=True, indent=2, ensure_ascii=False)
 
 
 class NullFormatter(TableFormatter):
@@ -510,7 +527,7 @@ class NullFormatter(TableFormatter):
   def __len__(self):
     return len(self._rows)
 
-  def __str__(self):
+  def __unicode__(self):
     return ''
 
   def AddRow(self, row):

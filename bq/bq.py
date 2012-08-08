@@ -7,8 +7,8 @@
 
 import cmd
 import codecs
+import httplib
 import json
-import logging
 import os
 import pdb
 import platform
@@ -24,6 +24,7 @@ import types
 # doesn't do this itself.
 
 
+import apiclient
 import httplib2
 import oauth2client
 import oauth2client.client
@@ -38,7 +39,7 @@ import table_formatter
 import bigquery_client
 
 flags.DEFINE_string(
-    'apilog', '',
+    'apilog', None,
     'Turn on logging of all server requests and responses. If no string is '
     'provided, log to stdout; if a string is provided, instead log to that '
     'file.')
@@ -121,7 +122,8 @@ flags.DEFINE_multistring(
 flags.DEFINE_string(
     'service_account', '',
     'Use this service account email address for authorization. '
-    'For example, 1234567890@developer.gserviceaccount.com')
+    'For example, 1234567890@developer.gserviceaccount.com.'
+    )
 flags.DEFINE_string(
     'service_account_private_key_file', '',
     'Filename that contains the service account private key. '
@@ -173,23 +175,6 @@ _DELIMITER_MAP = {
 # flags processing
 ####################
 
-
-
-def _SetupLoggerFromFlags():
-  if FLAGS['apilog'].present:
-    if FLAGS.apilog in ('', '-', '1', 'true', 'stdout'):
-      logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-    elif FLAGS.apilog == 'stderr':
-      logging.basicConfig(stream=sys.stderr, level=logging.INFO)
-    elif FLAGS.apilog:
-      logging.basicConfig(filename=FLAGS.apilog, level=logging.INFO)
-    else:
-      logging.basicConfig(level=logging.INFO)
-    # Turn on apiclient logging of http requests and responses.
-    FLAGS.dump_request_response = True
-  else:
-    # Effectively turn off logging.
-    logging.disable(logging.CRITICAL)
 
 
 def _GetBigqueryRcFilename():
@@ -412,7 +397,7 @@ class Client(object):
     # Note that we need to handle possible initialization tasks
     # for the case of being loaded as a library.
     _ProcessBigqueryrc()
-    _SetupLoggerFromFlags()
+    bigquery_client.ConfigurePythonLogger(FLAGS.apilog)
     credentials = _GetCredentialsFromFlags()
     client_args = {}
     global_args = ('credential_file', 'job_property',
@@ -633,11 +618,8 @@ class BigqueryCmd(NewCmd):
     retcode = 1
 
     contact_us_msg = (
-        '%s%sPlease send an email to bigquery-team@google.com to '
-        'report this, with the following information: \n\n') % (
-            message_prefix,
-            ' ' if message_prefix else '',
-            )
+        'Please send an email to bigquery-team@google.com to '
+        'report this, with the following information: \n\n')
     error_details = (
         '========================================\n'
         '== Platform ==\n'
@@ -645,6 +627,8 @@ class BigqueryCmd(NewCmd):
         '== bq version ==\n'
         '  %s\n'
         '== Command line ==\n'
+        '  %s\n'
+        '== UTC timestamp ==\n'
         '  %s\n'
         '== Error trace ==\n'
         '%s'
@@ -655,7 +639,8 @@ class BigqueryCmd(NewCmd):
                 platform.platform()]),
             _Version.VersionNumber(),
             sys.argv,
-            ''.join(traceback.format_tb(sys.exc_info()[2])),
+            time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()),
+            ''.join(traceback.format_tb(sys.exc_info()[2]))
             )
 
     codecs.register_error('strict', codecs.replace_errors)
@@ -669,12 +654,8 @@ class BigqueryCmd(NewCmd):
       response.append(_BIGQUERY_TOS_MESSAGE)
     elif isinstance(e, bigquery_client.BigqueryInvalidQueryError):
       response.append('Error in query string: %s' % (message,))
-    elif isinstance(e, bigquery_client.BigqueryInterfaceError):
-      response.append(contact_us_msg)
-      response.append(
-          'Bigquery service returned an invalid reply in %s operation:\n%s' % (
-              name, message))
-    elif isinstance(e, bigquery_client.BigqueryError):
+    elif (isinstance(e, bigquery_client.BigqueryError)
+          and not isinstance(e, bigquery_client.BigqueryInterfaceError)):
       response.append('BigQuery error in %s operation: %s' % (name, message))
     elif isinstance(e, (app.UsageError, TypeError)):
       response.append(message)
@@ -686,9 +667,37 @@ class BigqueryCmd(NewCmd):
     elif isinstance(e, KeyboardInterrupt):
       response.append('')
     else:  # pylint:disable-msg=W0703
+      # Errors with traceback information are printed here.
       # The traceback module has nicely formatted the error trace
       # for us, so we don't want to undo that via TextWrap.
-      print flags.TextWrap(contact_us_msg)
+      if isinstance(e, bigquery_client.BigqueryInterfaceError):
+        message_prefix = (
+            'Bigquery service returned an invalid reply in %s operation: %s.'
+            '\n\n'
+            'Please make sure you are using the latest version '
+            'of the bq tool and try again. '
+            'If this problem persists, you may have encountered a bug in the '
+            'bigquery client.' % (name, message))
+      elif isinstance(e, oauth2client.client.Error):
+        message_prefix = (
+            'Authorization error. This may be a network connection problem, '
+            'so please try again. If this problem persists, the credentials '
+            'may be corrupt. Try deleting and re-creating your credentials. '
+            'You can delete your credentials using '
+            '"bq init --delete_credentials".'
+            '\n\n'
+            'If this problem still occurs, you may have encountered a bug '
+            'in the bigquery client.')
+      elif (isinstance(e, httplib.HTTPException)
+            or isinstance(e, apiclient.errors.Error)
+            or isinstance(e, httplib2.HttpLib2Error)):
+        message_prefix = (
+            'Network connection problem encountered, please try again.'
+            '\n\n'
+            'If this problem persists, you may have encountered a bug in the '
+            'bigquery client.')
+
+      print flags.TextWrap(message_prefix + ' ' + contact_us_msg)
       print error_details
       response.append('Unexpected exception in %s operation: %s' % (
           name, message))
@@ -742,6 +751,9 @@ class _Load(BigqueryCmd):
 
     Usage:
       load <destination_table> <source> [<schema>]
+
+    The <destination_table> is the fully-qualified table name of table to
+    create, or append to if the table already exists.
 
     The <source> argument can be a path to a single local file, or a
     comma-separated list of URIs.
@@ -802,6 +814,10 @@ class _Query(BigqueryCmd):
         'destination_table', '',
         'Name of destination table for query results.',
         flag_values=fv)
+    flags.DEFINE_boolean(
+        'batch', False,
+        'Whether to run the query in batch mode.',
+        flag_values=fv)
 
   def RunWithArgs(self, *args):
     """Execute a query.
@@ -816,6 +832,8 @@ class _Query(BigqueryCmd):
         'destination_table': self.destination_table,
         'job_id': FLAGS.job_id,
         }
+    if FLAGS.batch:
+      kwds['priority'] = 'BATCH'
     client = Client.Get()
     job = client.Query(' '.join(args), **kwds)
     if not FLAGS.sync:
@@ -1149,7 +1167,7 @@ class _Make(BigqueryCmd):
       if client.DatasetExists(reference):
         message = "Dataset '%s' already exists." % (reference,)
         if not self.f:
-          raise bigquery_client.BigqueryDuplicateError(message)
+          raise bigquery_client.BigqueryError(message)
         else:
           print message
           return
@@ -1160,7 +1178,7 @@ class _Make(BigqueryCmd):
       if client.TableExists(reference):
         message = "Table '%s' already exists." % (reference,)
         if not self.f:
-          raise bigquery_client.BigqueryDuplicateError(message)
+          raise bigquery_client.BigqueryError(message)
         else:
           print message
           return
@@ -1274,8 +1292,7 @@ class _Show(BigqueryCmd):
     # pylint:disable-msg=C6115
     client = Client.Get()
     if self.j:
-      project_id = client.GetProjectReference().projectId
-      reference = JobReference.Create(projectId=project_id, jobId=identifier)
+      reference = client.GetJobReference(identifier)
     elif self.d:
       reference = client.GetDatasetReference(identifier)
     else:
@@ -1579,7 +1596,7 @@ class _Init(BigqueryCmd):
   def RunWithArgs(self):
     """Authenticate and create a default .bigqueryrc file."""
     _ProcessBigqueryrc()
-    _SetupLoggerFromFlags()
+    bigquery_client.ConfigurePythonLogger(FLAGS.apilog)
     if self.delete_credentials:
       return self.DeleteCredentials()
     bigqueryrc = _GetBigqueryRcFilename()
