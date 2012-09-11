@@ -12,6 +12,7 @@ import logging
 import os
 import pkgutil
 import re
+import string
 import sys
 import textwrap
 import time
@@ -46,9 +47,22 @@ def _ToLowerCamel(name):
   return re.sub('_[a-z]', lambda match: match.group(0)[1].upper(), name)
 
 
+def _ToFilename(url):
+  """Converts a url to a filename."""
+  return ''.join([c for c in url if c in string.ascii_lowercase])
+
+
 def _ApplyParameters(config, **kwds):
-  """Adds all kwds to config dict, adjusting names to camelcase."""
-  config.update((_ToLowerCamel(k), v) for k, v in kwds.iteritems() if v)
+  """Adds all kwds to config dict, adjusting keys to camelcase.
+
+  Note this does not remove entries that are set to None, however.
+
+  Args:
+    config: A configuration dict.
+    kwds: A dict of keys and values to set in the config.
+  """
+  config.update((_ToLowerCamel(k), v) for k, v in kwds.iteritems()
+                if v is not None)
 
 
 def ConfigurePythonLogger(apilog=None):
@@ -327,8 +341,8 @@ class BigqueryClient(object):
         # Use the api description packed with this client, if one exists.
         try:
           discovery_document = pkgutil.get_data(
-              'bigquery_client', 'discovery/bigquery.%s.rest.json'
-              % (self.api_version,))
+              'bigquery_client', 'discovery/%s.bigquery.%s.rest.json'
+              % (_ToFilename(self.api), self.api_version))
         except IOError:
           discovery_document = None
       if discovery_document is None:
@@ -350,7 +364,7 @@ class BigqueryClient(object):
               'Invalid API name or version: %s' % (str(e),))
       else:
         self._apiclient = discovery.build_from_document(
-            discovery_document, self.api, http=http,
+            discovery_document, http=http,
             model=bigquery_model,
             requestBuilder=bigquery_http)
     return self._apiclient
@@ -1498,13 +1512,13 @@ class BigqueryClient(object):
       **kwds: Passed on to self.ExecuteJob.
 
     Raises:
-      BigqueryInvalidQueryError: if no query is provided.
+      BigqueryClientError: if no query is provided.
 
     Returns:
       The resulting job info.
     """
     if not query:
-      raise BigqueryInvalidQueryError('No query string provided')
+      raise BigqueryClientError('No query string provided')
     query_config = {'query': query}
     if self.dataset_id:
       query_config['defaultDataset'] = dict(self.GetDatasetReference())
@@ -1525,7 +1539,8 @@ class BigqueryClient(object):
   def Load(self, destination_table_reference, source,
            schema=None, create_disposition=None, write_disposition=None,
            field_delimiter=None, skip_leading_rows=None, encoding=None,
-           max_bad_records=None, **kwds):
+           max_bad_records=None, allow_quoted_newlines=None,
+           **kwds):
     """Load the given data into BigQuery.
 
     The job will execute synchronously if sync=True is provided as an
@@ -1546,6 +1561,8 @@ class BigqueryClient(object):
           May be "UTF-8" or "ISO-8859-1". Defaults to UTF-8 if not specified.
       max_bad_records: Optional. Maximum number of bad records that should
           be ignored before the entire job is aborted.
+      allow_quoted_newlines: Optional. Whether to allow quoted newlines in csv
+          import data.
       **kwds: Passed on to self.ExecuteJob.
 
     Returns:
@@ -1565,7 +1582,8 @@ class BigqueryClient(object):
         load_config, create_disposition=create_disposition,
         write_disposition=write_disposition, field_delimiter=field_delimiter,
         skip_leading_rows=skip_leading_rows, encoding=encoding,
-        max_bad_records=max_bad_records)
+        max_bad_records=max_bad_records,
+    allow_quoted_newlines=allow_quoted_newlines)
     return self.ExecuteJob(configuration={'load': load_config},
                            upload_file=upload_file, **kwds)
 

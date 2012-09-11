@@ -5,23 +5,21 @@
 
 
 
+
 import cmd
 import codecs
 import httplib
 import json
 import os
 import pdb
+import pipes
 import platform
-import readline  # pylint:disable-msg=W0611
 import shlex
 import stat
 import sys
 import time
 import traceback
 import types
-
-# TODO(user): Improve our use of readline, because python
-# doesn't do this itself.
 
 
 import apiclient
@@ -37,6 +35,7 @@ import gflags as flags
 
 import table_formatter
 import bigquery_client
+
 
 flags.DEFINE_string(
     'apilog', None,
@@ -133,6 +132,10 @@ flags.DEFINE_string(
     'Password for private key. This password must match the password '
     'you set on the key when you created it in the Google APIs Console. '
     'Defaults to the default Google APIs Console private key password.')
+flags.DEFINE_string(
+    'service_account_credential_store', None,
+    'File to be used as a credential store for service accounts. '
+    'Must be set if using a service account.')
 
 FLAGS = flags.FLAGS
 # These are long names.
@@ -231,28 +234,72 @@ def _ResolveApiInfoFromFlags():
   return {'api': api, 'api_version': api_version}
 
 
-def _GetServiceAccountCredentialsFromFlags():
+def _GetServiceAccountCredentialsFromFlags(storage):
   if not oauth2client.client.HAS_OPENSSL:
     raise app.UsageError(
         'BigQuery requires OpenSSL to be installed in order to use '
         'service account credentials. Please install OpenSSL '
         'and the Python OpenSSL package.')
-  try:
-    with file(FLAGS.service_account_private_key_file, 'rb') as f:
-      key = f.read()
-  except IOError as e:
+
+  if FLAGS.service_account_private_key_file:
+    try:
+      with file(FLAGS.service_account_private_key_file, 'rb') as f:
+        key = f.read()
+    except IOError as e:
+      raise app.UsageError(
+          'Service account specified, but private key in file "%s" '
+          'cannot be read:\n%s' % (FLAGS.service_account_private_key_file, e))
+  else:
     raise app.UsageError(
-        'Service account specified, but private key in file "%s" '
-        'cannot be read:\n%s' % (FLAGS.service_account_private_key_file, e))
-  return oauth2client.client.SignedJwtAssertionCredentials(
+        'Service account authorization requires the '
+        'service_account_private_key_file flag to be set.')
+
+  credentials = oauth2client.client.SignedJwtAssertionCredentials(
       FLAGS.service_account, key, _CLIENT_SCOPE,
       private_key_password=FLAGS.service_account_private_key_password,
       user_agent=_CLIENT_USER_AGENT)
+  credentials.set_store(storage)
+  return credentials
+
+
+def _GetCredentialsFromOAuthFlow(storage):
+  print
+  print '******************************************************************'
+  print '** No OAuth2 credentials found, beginning authorization process **'
+  print '******************************************************************'
+  print
+  if FLAGS.headless:
+    print 'Running in headless mode, exiting.'
+    sys.exit(1)
+  while True:
+    # If authorization fails, we want to retry, rather than let this
+    # cascade up and get caught elsewhere. If users want out of the
+    # retry loop, they can ^C.
+    try:
+      flow = oauth2client.client.OAuth2WebServerFlow(**_CLIENT_INFO)
+      credentials = oauth2client.tools.run(flow, storage)
+      break
+    except (oauth2client.client.FlowExchangeError, SystemExit), e:
+      # Here SystemExit is "no credential at all", and the
+      # FlowExchangeError is "invalid" -- usually because you reused
+      # a token.
+      print 'Invalid authorization: %s' % (e,)
+      print
+    except httplib2.HttpLib2Error as e:
+      print 'Error communicating with server. Please check your internet '
+      print 'connection and try again.'
+      print
+      print 'Error is: %s' % (e,)
+      sys.exit(1)
+  print
+  print '************************************************'
+  print '** Continuing execution of BigQuery operation **'
+  print '************************************************'
+  print
+  return credentials
 
 
 def _GetCredentialsFromFlags():
-  if FLAGS.service_account:
-    return _GetServiceAccountCredentialsFromFlags()
 
   intended_perms = stat.S_IWUSR | stat.S_IRUSR
   if not os.path.exists(FLAGS.credential_file):
@@ -284,39 +331,10 @@ def _GetCredentialsFromFlags():
     sys.exit(1)
 
   if credentials is None or credentials.invalid:
-    print
-    print '******************************************************************'
-    print '** No OAuth2 credentials found, beginning authorization process **'
-    print '******************************************************************'
-    print
-    if FLAGS.headless:
-      print 'Running in headless mode, exiting.'
-      sys.exit(1)
-    while True:
-      # If authorization fails, we want to retry, rather than let this
-      # cascade up and get caught elsewhere. If users want out of the
-      # retry loop, they can ^C.
-      try:
-        flow = oauth2client.client.OAuth2WebServerFlow(**_CLIENT_INFO)
-        credentials = oauth2client.tools.run(flow, storage)
-        break
-      except (oauth2client.client.FlowExchangeError, SystemExit), e:
-        # Here SystemExit is "no credential at all", and the
-        # FlowExchangeError is "invalid" -- usually because you reused
-        # a token.
-        print 'Invalid authorization: %s' % (e,)
-        print
-      except httplib2.HttpLib2Error as e:
-        print 'Error communicating with server. Please check your internet '
-        print 'connection and try again.'
-        print
-        print 'Error is: %s' % (e,)
-        sys.exit(1)
-    print
-    print '************************************************'
-    print '** Continuing execution of BigQuery operation **'
-    print '************************************************'
-    print
+    if FLAGS.service_account:
+      credentials = _GetServiceAccountCredentialsFromFlags(storage)
+    else:
+      credentials = _GetCredentialsFromOAuthFlow(storage)
   return credentials
 
 
@@ -383,6 +401,7 @@ def _NormalizeFieldDelimiter(field_delimiter):
   return _DELIMITER_MAP.get(key, field_delimiter)
 
 
+
 class Client(object):
   """Class wrapping a singleton bigquery_client.BigqueryClient."""
   client = None
@@ -399,6 +418,7 @@ class Client(object):
     _ProcessBigqueryrc()
     bigquery_client.ConfigurePythonLogger(FLAGS.apilog)
     credentials = _GetCredentialsFromFlags()
+    assert credentials is not None
     client_args = {}
     global_args = ('credential_file', 'job_property',
                    'project_id', 'dataset_id', 'trace', 'sync',
@@ -544,8 +564,7 @@ class NewCmd(appcommands.Cmd):
       args = shlex.split(argv)
     except ValueError, e:
       raise SyntaxError(BigqueryCmd.EncodeForPrinting(e))
-    self.Run([self._command_name] + args)
-    return False
+    return self.Run([self._command_name] + args)
 
   def _HandleError(self, e):
     message = str(e)
@@ -557,8 +576,7 @@ class NewCmd(appcommands.Cmd):
   def RunDebug(self, args, kwds):
     """Run this command in debug mode."""
     try:
-      self.RunWithArgs(*args, **kwds)
-      return 0
+      return_value = self.RunWithArgs(*args, **kwds)
     except BaseException, e:
       # Don't break into the debugger for expected exceptions.
       if isinstance(e, app.UsageError) or (
@@ -580,14 +598,15 @@ class NewCmd(appcommands.Cmd):
       if not FLAGS.headless:
         pdb.post_mortem()
       return 1
+    return return_value
 
   def RunSafely(self, args, kwds):
     """Run this command, turning exceptions into print statements."""
     try:
-      self.RunWithArgs(*args, **kwds)
-      return 0
+      return_value = self.RunWithArgs(*args, **kwds)
     except BaseException, e:
       return self._HandleError(e)
+    return return_value
 
 
 class BigqueryCmd(NewCmd):
@@ -596,12 +615,10 @@ class BigqueryCmd(NewCmd):
   def RunSafely(self, args, kwds):
     """Run this command, printing information about any exceptions raised."""
     try:
-      self.RunWithArgs(*args, **kwds)
-      return 0
+      return_value = self.RunWithArgs(*args, **kwds)
     except BaseException, e:
       return BigqueryCmd.ProcessError(e, name=self._command_name)
-    # Shouldn't be able to get here.
-    return 1
+    return return_value
 
   @staticmethod
   def EncodeForPrinting(s):
@@ -745,6 +762,10 @@ class _Load(BigqueryCmd):
         'max_bad_records', 0,
         'Maximum number of bad records allowed before the entire job fails.',
         flag_values=fv)
+    flags.DEFINE_boolean(
+        'allow_quoted_newlines', None,
+        'Whether to allow quoted newlines in CSV import data.',
+        flag_values=fv)
 
   def RunWithArgs(self, destination_table, source, schema=None):
     """Perform a load operation of source into destination_table.
@@ -793,6 +814,7 @@ class _Load(BigqueryCmd):
         'encoding': self.encoding,
         'skip_leading_rows': self.skip_leading_rows,
         'max_bad_records': self.max_bad_records,
+        'allow_quoted_newlines': self.allow_quoted_newlines,
         'job_id': FLAGS.job_id,
         }
     if self.replace:
@@ -814,6 +836,10 @@ class _Query(BigqueryCmd):
         'destination_table', '',
         'Name of destination table for query results.',
         flag_values=fv)
+    flags.DEFINE_integer(
+        'max_rows', 100,
+        'How many rows to return in the result.',
+        flag_values=fv)
     flags.DEFINE_boolean(
         'batch', False,
         'Whether to run the query in batch mode.',
@@ -832,14 +858,15 @@ class _Query(BigqueryCmd):
         'destination_table': self.destination_table,
         'job_id': FLAGS.job_id,
         }
-    if FLAGS.batch:
+    if self.batch:
       kwds['priority'] = 'BATCH'
     client = Client.Get()
     job = client.Query(' '.join(args), **kwds)
     if not FLAGS.sync:
       self.PrintJobStartInfo(job)
     else:
-      _PrintTable(client, job['configuration']['query']['destinationTable'])
+      _PrintTable(client, job['configuration']['query']['destinationTable'],
+                  max_rows=self.max_rows)
 
 
 class _Extract(BigqueryCmd):
@@ -873,7 +900,8 @@ class _Extract(BigqueryCmd):
     table_reference = client.GetTableReference(source_table)
     job = client.Extract(
         table_reference, destination_uri,
-        field_delimiter=_NormalizeFieldDelimiter(self.field_delimiter), **kwds)
+        field_delimiter=_NormalizeFieldDelimiter(self.field_delimiter),
+    **kwds)
     if not FLAGS.sync:
       self.PrintJobStartInfo(job)
 
@@ -1399,6 +1427,10 @@ class _Wait(BigqueryCmd):
 class CommandLoop(cmd.Cmd):
   """Instance of cmd.Cmd built to work with NewCmd."""
 
+  class TerminateSignal(Exception):
+    """Exception type used for signaling loop completion."""
+    pass
+
   def __init__(self, commands, prompt=None):
     cmd.Cmd.__init__(self)
     self._commands = {'help': commands['help']}
@@ -1411,6 +1443,11 @@ class CommandLoop(cmd.Cmd):
         setattr(self, 'do_%s' % (name,), command.RunCmdLoop)
     self._default_prompt = prompt or 'BigQuery> '
     self._set_prompt()
+    self._last_return_code = 0
+
+  @property
+  def last_return_code(self):
+    return self._last_return_code
 
   def _set_prompt(self):
     client = Client().Get()
@@ -1420,17 +1457,28 @@ class CommandLoop(cmd.Cmd):
     else:
       self.prompt = self._default_prompt
 
-  def do_select(self, *args):
-    self._commands['query'].RunCmdLoop(' '.join(['select'] + list(args)))
-
   def do_EOF(self, *unused_args):
+    """Terminate the running command loop.
+
+    This function raises an exception to avoid the need to do
+    potentially-error-prone string parsing inside onecmd.
+
+    Returns:
+      Never returns.
+
+    Raises:
+      CommandLoop.TerminateSignal: always.
+    """
+    raise CommandLoop.TerminateSignal()
+
+  def postloop(self):
     print 'Goodbye.'
 
   def completedefault(self, unused_text, line, unused_begidx, unused_endidx):
     if not line:
       return []
     else:
-      command_name = line.split(' ', 2)[0]
+      command_name = line.partition(' ')[0].lower()
       usage = ''
       if command_name in self._commands:
         usage = self._commands[command_name].usage
@@ -1456,24 +1504,40 @@ class CommandLoop(cmd.Cmd):
       return 'EOF'
     words = line.strip().split()
     if len(words) > 1 and words[0].lower() == 'select':
-      return ' '.join(['select'] + words[1:])
+      return 'query %s' % (pipes.quote(line),)
     if len(words) == 1 and words[0] not in ['help', 'ls', 'version']:
       return 'help %s' % (line.strip(),)
     return line
 
   def onecmd(self, line):
+    """Process a single command.
+
+    Runs a single command, and stores the return code in
+    self._last_return_code. Always returns False unless the command
+    was EOF.
+
+    Args:
+      line: (str) Command line to process.
+
+    Returns:
+      A bool signaling whether or not the command loop should terminate.
+    """
     try:
-      return cmd.Cmd.onecmd(self, line)
+      self._last_return_code = cmd.Cmd.onecmd(self, line)
+    except CommandLoop.TerminateSignal:
+      return True
     except BaseException, e:
       name = line.split(' ')[0]
       BigqueryCmd.ProcessError(e, name=name)
-      return False
+      self._last_return_code = 1
+    return False
 
   def get_names(self):
     names = dir(self)
     commands = (name for name in self._commands
                 if name not in self._special_command_names)
     names.extend('do_%s' % (name,) for name in commands)
+    names.append('do_select')
     names.remove('do_EOF')
     return names
 
@@ -1489,6 +1553,7 @@ class CommandLoop(cmd.Cmd):
     else:
       setattr(client, name, value)
       self._set_prompt()
+    return 0
 
   def do_unset(self, line):
     """Unset the value of the project_id or dataset_id flag."""
@@ -1501,6 +1566,7 @@ class CommandLoop(cmd.Cmd):
       if name == 'project_id':
         client.dataset_id = ''
       self._set_prompt()
+    return 0
 
   def do_help(self, command_name):
     """Print the help for command_name (if present) or general help."""
@@ -1563,6 +1629,7 @@ class _Repl(BigqueryCmd):
         break
       except KeyboardInterrupt:
         print
+    return repl.last_return_code
 
 
 class _Init(BigqueryCmd):

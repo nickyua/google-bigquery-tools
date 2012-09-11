@@ -42,26 +42,48 @@ py_version = platform.python_version()
 if py_version < '2.6.5' or py_version >= '3':
   raise ValueError('BigQuery requires Python >= 2.6.5.')
 
-_BQ_VERSION = '2.0.7'
+_BQ_VERSION = '2.0.8'
 
 setup(name='bigquery',
       version=_BQ_VERSION,
       description='BigQuery command-line tool',
-      url='http://code.google.com/p/bigquery/',
+      url='http://code.google.com/p/google-bigquery-tools/',
+      author='Google Inc.',
+      author_email='bigquery-team@google.com',
+      # Contained modules and scripts.
       py_modules=[
           'bq',
           'bigquery_client',
           'table_formatter',
           ],
-      include_package_data=True,
-      packages=['discovery'],
-      package_data={
-          'discovery': ['*'],
-          },
       entry_points={
           'console_scripts': CONSOLE_SCRIPTS,
           },
       install_requires=REQUIRED_PACKAGES,
       provides=[
           'bigquery (%s)' % (_BQ_VERSION,),
-          ])
+          ],
+      # Information for packaging of the discovery document.
+      include_package_data=True,
+      packages=['discovery'],
+      package_data={
+          'discovery': ['*'],
+          },
+      # PyPI package information.
+      classifiers=[
+          'Development Status :: 5 - Production/Stable',
+          'Environment :: Console',
+          'Intended Audience :: Developers',
+          'Intended Audience :: End Users/Desktop',
+          'License :: OSI Approved :: Apache Software License',
+          'Operating System :: MacOS :: MacOS X',
+          'Operating System :: Microsoft :: Windows',
+          'Operating System :: POSIX :: Linux',
+          'Programming Language :: Python :: 2.7',
+          'Topic :: Database :: Front-Ends',
+          'Topic :: Software Development :: Libraries',
+          'Topic :: Software Development :: Libraries :: Python Modules',
+          ],
+      license='Apache 2.0',
+      keywords='google bigquery library',
+     )
