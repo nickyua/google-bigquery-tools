@@ -27,8 +27,8 @@ from setuptools import setup  # pylint:disable-msg=C6204
 REQUIRED_PACKAGES = [
     'google-apputils',
     'python-gflags',
-    'google-api-python-client>=1.0c1',
-    'oauth2client>=1.0c1',
+    'google-api-python-client==1.0',
+    'oauth2client==1.0',
     'httplib2',
     ]
 CONSOLE_SCRIPTS = [
@@ -42,7 +42,7 @@ py_version = platform.python_version()
 if py_version < '2.6.5' or py_version >= '3':
   raise ValueError('BigQuery requires Python >= 2.6.5.')
 
-_BQ_VERSION = '2.0.8'
+_BQ_VERSION = '2.0.9'
 
 setup(name='bigquery',
       version=_BQ_VERSION,
