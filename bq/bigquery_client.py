@@ -1539,7 +1539,8 @@ class BigqueryClient(object):
   def Load(self, destination_table_reference, source,
            schema=None, create_disposition=None, write_disposition=None,
            field_delimiter=None, skip_leading_rows=None, encoding=None,
-           max_bad_records=None, allow_quoted_newlines=None,
+           quote=None, max_bad_records=None, allow_quoted_newlines=None,
+           source_format=None,
            **kwds):
     """Load the given data into BigQuery.
 
@@ -1559,10 +1560,14 @@ class BigqueryClient(object):
       skip_leading_rows: Optional. Number of rows of initial data to skip.
       encoding: Optional. Specifies character encoding of the input data.
           May be "UTF-8" or "ISO-8859-1". Defaults to UTF-8 if not specified.
+      quote: Optional. Quote character to use. Default is '"'. Note that
+          quoting is done on the raw binary data before encoding is applied.
       max_bad_records: Optional. Maximum number of bad records that should
           be ignored before the entire job is aborted.
       allow_quoted_newlines: Optional. Whether to allow quoted newlines in csv
           import data.
+      source_format: Optional. Format of source data. May be "CSV",
+         "DATASTORE_BACKUP", or "NEWLINE_DELIMITED_JSON".
       **kwds: Passed on to self.ExecuteJob.
 
     Returns:
@@ -1582,13 +1587,15 @@ class BigqueryClient(object):
         load_config, create_disposition=create_disposition,
         write_disposition=write_disposition, field_delimiter=field_delimiter,
         skip_leading_rows=skip_leading_rows, encoding=encoding,
-        max_bad_records=max_bad_records,
-    allow_quoted_newlines=allow_quoted_newlines)
+        quote=quote, max_bad_records=max_bad_records,
+        source_format=source_format,
+        allow_quoted_newlines=allow_quoted_newlines)
     return self.ExecuteJob(configuration={'load': load_config},
                            upload_file=upload_file, **kwds)
 
   def Extract(self, source_table, destination_uri,
               print_header=None, field_delimiter=None,
+              destination_format=None,
               **kwds):
     """Extract the given table from BigQuery.
 
@@ -1600,6 +1607,8 @@ class BigqueryClient(object):
       destination_uri: String specifying destination location.
       print_header: Optional. Whether to print out a header row in the results.
       field_delimiter: Optional. Specifies the single byte field delimiter.
+      destination_format: Optional. Format to extract table to. May be "CSV"
+         or "NEWLINE_DELIMITED_JSON".
       **kwds: Passed on to self.ExecuteJob.
 
     Returns:
@@ -1614,6 +1623,7 @@ class BigqueryClient(object):
     extract_config = {'sourceTable': dict(source_table)}
     _ApplyParameters(
         extract_config, destination_uri=destination_uri,
+        destination_format=destination_format,
         print_header=print_header, field_delimiter=field_delimiter)
     return self.ExecuteJob(configuration={'extract': extract_config}, **kwds)
 

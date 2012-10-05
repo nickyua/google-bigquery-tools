@@ -15,7 +15,6 @@ import pdb
 import pipes
 import platform
 import shlex
-import stat
 import sys
 import time
 import traceback
@@ -133,7 +132,7 @@ flags.DEFINE_string(
     'you set on the key when you created it in the Google APIs Console. '
     'Defaults to the default Google APIs Console private key password.')
 flags.DEFINE_string(
-    'service_account_credential_store', None,
+    'service_account_credential_file', None,
     'File to be used as a credential store for service accounts. '
     'Must be set if using a service account.')
 
@@ -149,8 +148,9 @@ BigqueryClient = bigquery_client.BigqueryClient
 
 _CLIENT_USER_AGENT = 'bq/2.0'
 _CLIENT_SCOPE = 'https://www.googleapis.com/auth/bigquery'
+_CLIENT_ID = '977385342095.apps.googleusercontent.com'
 _CLIENT_INFO = {
-    'client_id': '977385342095.apps.googleusercontent.com',
+    'client_id': _CLIENT_ID,
     'client_secret': 'wbER7576mc_1YOII0dGk7jEE',
     'scope': _CLIENT_SCOPE,
     'user_agent': _CLIENT_USER_AGENT,
@@ -234,7 +234,7 @@ def _ResolveApiInfoFromFlags():
   return {'api': api, 'api_version': api_version}
 
 
-def _GetServiceAccountCredentialsFromFlags(storage):
+def _GetServiceAccountCredentialsFromFlags(storage):  # pylint:disable-msg=W0613
   if not oauth2client.client.HAS_OPENSSL:
     raise app.UsageError(
         'BigQuery requires OpenSSL to be installed in order to use '
@@ -254,12 +254,10 @@ def _GetServiceAccountCredentialsFromFlags(storage):
         'Service account authorization requires the '
         'service_account_private_key_file flag to be set.')
 
-  credentials = oauth2client.client.SignedJwtAssertionCredentials(
+  return oauth2client.client.SignedJwtAssertionCredentials(
       FLAGS.service_account, key, _CLIENT_SCOPE,
       private_key_password=FLAGS.service_account_private_key_password,
       user_agent=_CLIENT_USER_AGENT)
-  credentials.set_store(storage)
-  return credentials
 
 
 def _GetCredentialsFromOAuthFlow(storage):
@@ -301,23 +299,24 @@ def _GetCredentialsFromOAuthFlow(storage):
 
 def _GetCredentialsFromFlags():
 
-  intended_perms = stat.S_IWUSR | stat.S_IRUSR
-  if not os.path.exists(FLAGS.credential_file):
-    try:
-      old_umask = os.umask(intended_perms)
-      open(FLAGS.credential_file, 'w').close()
-      os.umask(old_umask)
-    except OSError, e:  # pylint:disable-msg=W0703
-      raise bigquery_client.BigqueryError(
-          'Cannot create credential file %s: %s' % (FLAGS.credential_file, e))
+  if FLAGS.service_account:
+    credentials_getter = _GetServiceAccountCredentialsFromFlags
+    credential_file = FLAGS.service_account_credential_file
+    if not credential_file:
+      raise app.UsageError(
+          'The flag --service_account_credential_file must be specified '
+          'if --service_account is used.')
+  else:
+    credentials_getter = _GetCredentialsFromOAuthFlow
+    credential_file = FLAGS.credential_file
+
   try:
-    credential_perms = os.stat(FLAGS.credential_file).st_mode
-    if credential_perms != intended_perms:
-      os.chmod(FLAGS.credential_file, intended_perms)
+    # Note that oauth2client.file ensures the file is created with
+    # the correct permissions.
+    storage = oauth2client.file.Storage(credential_file)
   except OSError, e:
     raise bigquery_client.BigqueryError(
-        'Error setting permissions on %s: %s' % (FLAGS.credential_file, e))
-  storage = oauth2client.file.Storage(FLAGS.credential_file)
+        'Cannot create credential file %s: %s' % (FLAGS.credential_file, e))
   try:
     credentials = storage.get()
   except BaseException, e:
@@ -331,10 +330,8 @@ def _GetCredentialsFromFlags():
     sys.exit(1)
 
   if credentials is None or credentials.invalid:
-    if FLAGS.service_account:
-      credentials = _GetServiceAccountCredentialsFromFlags(storage)
-    else:
-      credentials = _GetCredentialsFromOAuthFlow(storage)
+    credentials = credentials_getter(storage)
+    credentials.set_store(storage)
   return credentials
 
 
@@ -399,7 +396,6 @@ def _NormalizeFieldDelimiter(field_delimiter):
   # Allow TAB and \\t substitution.
   key = field_delimiter.lower()
   return _DELIMITER_MAP.get(key, field_delimiter)
-
 
 
 class Client(object):
@@ -758,6 +754,11 @@ class _Load(BigqueryCmd):
         'replace', False,
         'If true erase existing contents before loading new data.',
         flag_values=fv)
+    flags.DEFINE_string(
+        'quote', None,
+        'Quote character to use to enclose records. Default is ". '
+        'To indicate no quote character at all, use an empty string.',
+        flag_values=fv)
     flags.DEFINE_integer(
         'max_bad_records', 0,
         'Maximum number of bad records allowed before the entire job fails.',
@@ -765,6 +766,16 @@ class _Load(BigqueryCmd):
     flags.DEFINE_boolean(
         'allow_quoted_newlines', None,
         'Whether to allow quoted newlines in CSV import data.',
+        flag_values=fv)
+    flags.DEFINE_enum(
+        'source_format', None,
+        ['CSV',
+         'NEWLINE_DELIMITED_JSON',
+         'DATASTORE_BACKUP'],
+        'Format of source data. Options include:'
+        '\n CSV'
+        '\n NEWLINE_DELIMITED_JSON'
+        '\n DATASTORE_BACKUP',
         flag_values=fv)
 
   def RunWithArgs(self, destination_table, source, schema=None):
@@ -816,11 +827,14 @@ class _Load(BigqueryCmd):
         'max_bad_records': self.max_bad_records,
         'allow_quoted_newlines': self.allow_quoted_newlines,
         'job_id': FLAGS.job_id,
+        'source_format': self.source_format,
         }
     if self.replace:
       opts['write_disposition'] = 'WRITE_TRUNCATE'
     if self.field_delimiter:
       opts['field_delimiter'] = _NormalizeFieldDelimiter(self.field_delimiter)
+    if self.quote is not None:
+      opts['quote'] = _NormalizeFieldDelimiter(self.quote)
 
     job = client.Load(table_reference, source, schema=schema, **opts)
     if not FLAGS.sync:
@@ -879,6 +893,12 @@ class _Extract(BigqueryCmd):
         'The character that indicates the boundary between columns in the '
         'output file. "\\t" and "tab" are accepted names for tab.',
         short_name='F', flag_values=fv)
+    flags.DEFINE_enum(
+        'destination_format', None,
+        ['CSV', 'NEWLINE_DELIMITED_JSON'],
+        'The format with which to write the extracted data. Tables with '
+        'nested or repeated fields cannot be extracted to CSV.',
+        flag_values=fv)
 
   def RunWithArgs(self, source_table, destination_uri):
     """Perform an extract operation of source_table into destination_uri.
@@ -901,7 +921,7 @@ class _Extract(BigqueryCmd):
     job = client.Extract(
         table_reference, destination_uri,
         field_delimiter=_NormalizeFieldDelimiter(self.field_delimiter),
-    **kwds)
+        destination_format=self.destination_format, **kwds)
     if not FLAGS.sync:
       self.PrintJobStartInfo(job)
 
@@ -1647,7 +1667,7 @@ class _Init(BigqueryCmd):
   def DeleteCredentials(self):
     """Deletes this user's credential file."""
     _ProcessBigqueryrc()
-    filename = FLAGS.credential_file
+    filename = FLAGS.service_account_credential_file or FLAGS.credential_file
     if not os.path.exists(filename):
       print 'Credential file %s does not exist.' % (filename,)
       return 0
