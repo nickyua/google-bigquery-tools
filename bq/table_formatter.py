@@ -560,5 +560,5 @@ def GetFormatter(table_format):
   elif table_format == 'none':
     table_formatter = NullFormatter()
   else:
-    raise FormatterException('Unknown format: %s' % (table_formatter,))
+    raise FormatterException('Unknown format: %s' % table_format)
   return table_formatter

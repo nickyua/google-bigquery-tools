@@ -8,6 +8,7 @@
 
 import cmd
 import codecs
+import datetime
 import httplib
 import json
 import os
@@ -342,8 +343,21 @@ def _GetFormatterFromFlags(secondary_format='sparse'):
     return table_formatter.GetFormatter(secondary_format)
 
 
+def _ExpandCustomTypes(fields, rows):
+  # TODO(user): add custom formatting as a feature of the formatter instead.
+  for i, field in enumerate(fields):
+    if field['type'] == 'TIMESTAMP' or field['type'] == 'timestamp':
+      for row in rows:
+        try:
+          date = datetime.datetime.utcfromtimestamp(float(row[i]))
+          row[i] = date.strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+          row[i] = '<date out of range for display>'
+
+
 def _PrintTable(client, table_dict, **extra_args):
   fields, rows = client.ReadSchemaAndRows(table_dict, **extra_args)
+  _ExpandCustomTypes(fields, rows)
   formatter = _GetFormatterFromFlags(secondary_format='pretty')
   formatter.AddFields(fields)
   formatter.AddRows(rows)

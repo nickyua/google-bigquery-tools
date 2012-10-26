@@ -263,15 +263,17 @@ class BigqueryHttp(http_request.HttpRequest):
     try:
       return super(BigqueryHttp, self).execute(**kwds)
     except apiclient.errors.HttpError, e:
+      # TODO(user): Remove this when apiclient supports logging
+      # of error responses.
+      self._model._log_response(e.resp, e.content)  # pylint:disable-msg=W0212
       if e.resp.get('content-type', '').startswith('application/json'):
-        # TODO(user): Remove this when apiclient supports logging
-        # of error responses.
-        self._model._log_response(e.resp, e.content)  # pylint:disable-msg=W0212
         BigqueryClient.RaiseError(json.loads(e.content))
       else:
         raise BigqueryCommunicationError(
-            'Could not connect with BigQuery server, http response status: ' +
-            e.resp.get('status', '(unexpected)'))
+            ('Could not connect with BigQuery server.\n'
+             'Http response status: %s\n'
+             'Http response content:\n%s') % (
+                 e.resp.get('status', '(unexpected)'), e.content))
 
 
 class BigqueryClient(object):
