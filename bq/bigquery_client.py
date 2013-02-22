@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
+# Copyright 2012 Google Inc. All Rights Reserved.
 
 """Bigquery Client library for Python."""
 
@@ -23,6 +23,7 @@ from apiclient import discovery
 from apiclient import http as http_request
 from apiclient import model
 import httplib2
+
 
 # To configure apiclient logging.
 import gflags as flags
@@ -57,9 +58,10 @@ def _ApplyParameters(config, **kwds):
 
   Note this does not remove entries that are set to None, however.
 
+  kwds: A dict of keys and values to set in the config.
+
   Args:
     config: A configuration dict.
-    kwds: A dict of keys and values to set in the config.
   """
   config.update((_ToLowerCamel(k), v) for k, v in kwds.iteritems()
                 if v is not None)
@@ -143,6 +145,9 @@ class BigqueryError(Exception):
     if reason == 'termsOfServiceNotAccepted':
       return BigqueryTermsOfServiceError(
           message, error, error_ls, job_ref=job_ref)
+    if reason == 'backendError':
+      return BigqueryBackendError(
+          message, error, error_ls, job_ref=job_ref)
     # We map the less interesting errors to BigqueryServiceError.
     return BigqueryServiceError(message, error, error_ls, job_ref=job_ref)
 
@@ -208,6 +213,11 @@ class BigqueryInvalidQueryError(BigqueryServiceError):
 
 class BigqueryTermsOfServiceError(BigqueryAccessDeniedError):
   """User has not ACK'd ToS."""
+  pass
+
+
+class BigqueryBackendError(BigqueryServiceError):
+  """A backend error typically corresponding to retriable HTTP 503 failures."""
   pass
 
 
@@ -330,11 +340,21 @@ class BigqueryClient(object):
     if self.dataset_id and not self.project_id:
       raise ValueError('Cannot set dataset_id without project_id')
 
+  def GetHttp(self):
+    """Returns the httplib2 Http to use."""
+    http = httplib2.Http()
+    return http
+
+  def GetDiscoveryUrl(self):
+    """Returns the url to the discovery document for bigquery."""
+    discovery_url = self.api + '/discovery/v1/apis/{api}/{apiVersion}/rest'
+    return discovery_url
+
   @property
   def apiclient(self):
     """Return the apiclient attached to self."""
     if self._apiclient is None:
-      http = self.credentials.authorize(httplib2.Http())
+      http = self.credentials.authorize(self.GetHttp())
       bigquery_model = BigqueryModel(self.trace)
       bigquery_http = BigqueryHttp.Factory(
           bigquery_model)
@@ -348,20 +368,19 @@ class BigqueryClient(object):
         except IOError:
           discovery_document = None
       if discovery_document is None:
-        discovery_url = '%s/discovery/v1/apis/{api}/{apiVersion}/rest' % (
-            self.api,)
         try:
           self._apiclient = discovery.build(
               'bigquery', self.api_version, http=http,
-              discoveryServiceUrl=discovery_url,
+              discoveryServiceUrl=self.GetDiscoveryUrl(),
               model=bigquery_model,
               requestBuilder=bigquery_http)
         except (httplib2.ServerNotFoundError, apiclient.errors.HttpError), e:
           # We can't find the specified server.
           raise BigqueryCommunicationError(
-              'Cannot contact server. Please try again. Error: %s' % (str(e),))
+              'Cannot contact server. Please try again.\nError: %s'
+              '\nContent: %s' % (str(e), e.content))
         except apiclient.errors.UnknownApiNameOrVersion, e:
-          # We can't resolve the discovery_url for the given server.
+          # We can't resolve the discovery url for the given server.
           raise BigqueryCommunicationError(
               'Invalid API name or version: %s' % (str(e),))
       else:
@@ -612,15 +631,22 @@ class BigqueryClient(object):
 
   def ReadTableRows(self, table_dict, max_rows=sys.maxint):
     """Read at most max_rows rows from a table."""
+    page_token = None
     rows = []
     while len(rows) < max_rows:
       data = self.apiclient.tabledata().list(
-          maxResults=min(10000, max_rows - len(rows)),
-          startIndex=len(rows), **table_dict).execute()
+          maxResults=max_rows - len(rows),
+          pageToken=page_token,
+          **table_dict).execute()
+      page_token = data.get('pageToken', None)
       max_rows = min(max_rows, int(data['totalRows']))
       more_rows = data.get('rows', [])
       for row in more_rows:
         rows.append([entry.get('v', '') for entry in row.get('f', [])])
+      if not page_token and len(rows) != max_rows:
+        raise BigqueryInterfaceError(
+            'PageToken missing for %r' % (
+                ApiClientHelper.TableReference.Create(**table_dict),))
       if not more_rows and len(rows) != max_rows:
         raise BigqueryInterfaceError(
             'Not enough rows returned by server for %r' % (
@@ -976,7 +1002,8 @@ class BigqueryClient(object):
         BigqueryClient.ConstructObjectReference, self.ListJobs(**kwds))
 
   def ListJobs(self, reference=None,
-               max_results=None, state_filter=None):
+               max_results=None, state_filter=None,
+               all_users=None):
     """Return a list of jobs.
 
     Args:
@@ -984,6 +1011,8 @@ class BigqueryClient(object):
       max_results: The maximum number of jobs to return.
       state_filter: A single state filter or a list of filters to
         apply. If not specified, no filtering is applied.
+     all_users: Whether to list jobs for all users of the project. Requesting
+       user must be an owner of the project to list all jobs.
 
     Returns:
       A list of jobs.
@@ -991,14 +1020,14 @@ class BigqueryClient(object):
     reference = self._NormalizeProjectReference(reference)
     _Typecheck(reference, ApiClientHelper.ProjectReference, method='ListJobs')
     request = self._PrepareListRequest(reference, max_results, None)
-    request['projection'] = 'full'
     if state_filter is not None:
       # The apiclient wants enum values as lowercase strings.
       if isinstance(state_filter, basestring):
         state_filter = state_filter.lower()
       else:
         state_filter = [s.lower() for s in state_filter]
-      request['stateFilter'] = state_filter
+    _ApplyParameters(request, projection='full',
+                     state_filter=state_filter, all_users=all_users)
     jobs = self.apiclient.jobs().list(**request).execute()
     return jobs.get('jobs', [])
 
@@ -1308,9 +1337,10 @@ class BigqueryClient(object):
       job_request['jobReference'] = {'jobId': job_id}
     media_upload = ''
     if upload_file:
+      resumable = True
       media_upload = http_request.MediaFileUpload(
           filename=upload_file, mimetype='application/octet-stream',
-          resumable=True)
+          resumable=resumable)
     result = self.apiclient.jobs().insert(
         body=job_request, media_body=media_upload,
         projectId=project_id).execute()
@@ -1443,6 +1473,9 @@ class BigqueryClient(object):
       except BigqueryCommunicationError, e:
         # Communication errors while waiting on a job are okay.
         logging.warning('Transient error during job status check: %s', e)
+      except BigqueryBackendError, e:
+        # Temporary server errors while waiting on a job are okay.
+        logging.warning('Transient error during job status check: %s', e)
       for _ in xrange(waits.next()):
         current_wait = time.time() - start_time
         printer.Print(job_reference.jobId, current_wait, current_status)
@@ -1495,7 +1528,9 @@ class BigqueryClient(object):
 
   def Query(self, query, destination_table=None,
             create_disposition=None, write_disposition=None,
-            priority=None, **kwds):
+            priority=None, preserve_nulls=None,
+            **kwds):
+    # pylint:disable-msg=g-doc-args
     """Execute the given query, returning the created job.
 
     The job will execute synchronously if sync=True is provided as an
@@ -1511,6 +1546,8 @@ class BigqueryClient(object):
           the destination_table.
       priority: Optional. Priority to run the query with. Either
           'INTERACTIVE' (default) or 'BATCH'.
+      preserve_nulls: Optional. Indicates whether to preserve nulls in input
+          data. Temporary flag; will be removed in a future version.
       **kwds: Passed on to self.ExecuteJob.
 
     Raises:
@@ -1531,10 +1568,11 @@ class BigqueryClient(object):
         raise BigqueryError('Invalid value %s for destination_table: %s' % (
             destination_table, e))
       query_config['destinationTable'] = dict(reference)
-    if priority is not None:
-      query_config['priority'] = priority
     _ApplyParameters(
-        query_config, create_disposition=create_disposition,
+        query_config,
+        create_disposition=create_disposition,
+        preserve_nulls=preserve_nulls,
+        priority=priority,
         write_disposition=write_disposition)
     return self.ExecuteJob({'query': query_config}, **kwds)
 

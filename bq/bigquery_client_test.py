@@ -17,7 +17,7 @@ import bigquery_client
 class BigqueryClientTest(googletest.TestCase):
 
   def setUp(self):
-    self.client = bigquery_client.BigqueryClient(api='', api_version='')
+    self.client = bigquery_client.BigqueryClient(api='http', api_version='')
     self.reference_tests = {
         'prj:': ('prj', '', ''),
         'example.com:prj': ('example.com:prj', '', ''),
@@ -161,7 +161,7 @@ class BigqueryClientTest(googletest.TestCase):
     # Confirm we handle arbitrary errors gracefully.
     try:
       bigquery_client.BigqueryClient.RaiseError({})
-    except bigquery_client.BigqueryError as e:
+    except bigquery_client.BigqueryError as _:
       pass
 
 

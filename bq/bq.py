@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-# Copyright 2011 Google Inc. All Rights Reserved.
+#
+# Copyright 2012 Google Inc. All Rights Reserved.
 
 """Python script for interacting with BigQuery."""
 
@@ -45,8 +46,7 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'api',
     'https://www.googleapis.com',
-    'API endpoint to talk to.'
-    )
+    'API endpoint to talk to.')
 flags.DEFINE_string(
     'api_version', 'v2',
     'API version to use.')
@@ -137,6 +137,7 @@ flags.DEFINE_string(
     'File to be used as a credential store for service accounts. '
     'Must be set if using a service account.')
 
+
 FLAGS = flags.FLAGS
 # These are long names.
 # pylint:disable-msg=C6409
@@ -148,7 +149,9 @@ BigqueryClient = bigquery_client.BigqueryClient
 # pylint:enable-msg=C6409
 
 _CLIENT_USER_AGENT = 'bq/2.0'
-_CLIENT_SCOPE = 'https://www.googleapis.com/auth/bigquery'
+_CLIENT_SCOPE = [
+    'https://www.googleapis.com/auth/bigquery',
+]
 _CLIENT_ID = '977385342095.apps.googleusercontent.com'
 _CLIENT_INFO = {
     'client_id': _CLIENT_ID,
@@ -343,23 +346,44 @@ def _GetFormatterFromFlags(secondary_format='sparse'):
     return table_formatter.GetFormatter(secondary_format)
 
 
-def _ExpandCustomTypes(fields, rows):
-  # TODO(user): add custom formatting as a feature of the formatter instead.
+def _ExpandForPrinting(fields, rows, formatter):
+  """Expand entries that require special bq-specific formatting."""
+
+  def NormalizeTimestamp(entry):
+    try:
+      date = datetime.datetime.utcfromtimestamp(float(entry))
+      return date.strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+      return '<date out of range for display>'
+
+  column_normalizers = {}
   for i, field in enumerate(fields):
-    if field['type'] == 'TIMESTAMP' or field['type'] == 'timestamp':
-      for row in rows:
-        try:
-          date = datetime.datetime.utcfromtimestamp(float(row[i]))
-          row[i] = date.strftime('%Y-%m-%d %H:%M:%S')
-        except ValueError:
-          row[i] = '<date out of range for display>'
+    if field['type'].upper() == 'TIMESTAMP':
+      column_normalizers[i] = NormalizeTimestamp
+
+  def NormalizeNone():
+    if isinstance(formatter, table_formatter.JsonFormatter):
+      return None
+    elif isinstance(formatter, table_formatter.CsvFormatter):
+      return ''
+    else:
+      return 'NULL'
+
+  def NormalizeEntry(i, entry):
+    if entry is None:
+      return NormalizeNone()
+    elif i in column_normalizers:
+      return column_normalizers[i](entry)
+    return entry
+
+  return ([NormalizeEntry(i, e) for i, e in enumerate(row)] for row in rows)
 
 
 def _PrintTable(client, table_dict, **extra_args):
   fields, rows = client.ReadSchemaAndRows(table_dict, **extra_args)
-  _ExpandCustomTypes(fields, rows)
   formatter = _GetFormatterFromFlags(secondary_format='pretty')
   formatter.AddFields(fields)
+  rows = _ExpandForPrinting(fields, rows, formatter)
   formatter.AddRows(rows)
   formatter.Print()
 
@@ -645,8 +669,11 @@ class BigqueryCmd(NewCmd):
     retcode = 1
 
     contact_us_msg = (
-        'Please send an email to bigquery-team@google.com to '
-        'report this, with the following information: \n\n')
+        'Google engineers monitor and answer questions on Stack Overflow, with '
+        'the tag google-bigquery:\n'
+        '  http://stackoverflow.com/questions/ask?tags=google-bigquery\n'
+        'Please include a brief description of the steps that led to this '
+        'issue, as well as the following information: \n\n')
     error_details = (
         '========================================\n'
         '== Platform ==\n'
@@ -872,6 +899,10 @@ class _Query(BigqueryCmd):
         'batch', False,
         'Whether to run the query in batch mode.',
         flag_values=fv)
+    flags.DEFINE_boolean(
+        'append_table', False,
+        'When a destination table is specified, whether or not to append.',
+        flag_values=fv)
 
   def RunWithArgs(self, *args):
     """Execute a query.
@@ -885,7 +916,11 @@ class _Query(BigqueryCmd):
     kwds = {
         'destination_table': self.destination_table,
         'job_id': FLAGS.job_id,
+        'preserve_nulls': True,
         }
+    if self.destination_table and self.append_table:
+      kwds['write_disposition'] = 'WRITE_APPEND'
+
     if self.batch:
       kwds['priority'] = 'BATCH'
     client = Client.Get()
@@ -941,10 +976,14 @@ class _Extract(BigqueryCmd):
 
 
 class _List(BigqueryCmd):
-  usage = """ls [(-j|-p|-d)] [-n <number>] [<identifier>]"""
+  usage = """ls [(-j|-p|-d)] [-a] [-n <number>] [<identifier>]"""
 
   def __init__(self, name, fv):
     super(_List, self).__init__(name, fv)
+    flags.DEFINE_boolean(
+        'all_jobs', None,
+        'Show results from all users in this project (for listing jobs only).',
+        short_name='a', flag_values=fv)
     flags.DEFINE_boolean(
         'jobs', False,
         'Show jobs described by this identifier.',
@@ -982,6 +1021,8 @@ class _List(BigqueryCmd):
           'Cannot specify more than one of -j and -p.')
     if self.p and identifier:
       raise app.UsageError('Cannot specify an identifier with -p')
+    if self.a and not self.j:
+      raise app.UsageError('-a can only be specified with -j')
 
     client = Client.Get()
     formatter = _GetFormatterFromFlags()
@@ -1018,7 +1059,8 @@ class _List(BigqueryCmd):
       results = map(  # pylint:disable-msg=C6402
           client.FormatJobInfo,
           client.ListJobs(reference=project_reference,
-                          max_results=self.max_results))
+                          max_results=self.max_results,
+                          all_users=self.a))
     elif self.p or reference is None:
       BigqueryClient.ConfigureFormatter(formatter, ProjectReference)
       results = map(  # pylint:disable-msg=C6402
@@ -1128,6 +1170,10 @@ class _Copy(BigqueryCmd):
         'force', False,
         "Ignore existing destination tables, don't prompt.",
         short_name='f', flag_values=fv)
+    flags.DEFINE_boolean(
+        'append_table', False,
+        'Append to an existing table.',
+        short_name='a', flag_values=fv)
 
   def RunWithArgs(self, source_table, dest_table):
     """Copies one table to another.
@@ -1139,7 +1185,10 @@ class _Copy(BigqueryCmd):
     source_reference = client.GetTableReference(source_table)
     dest_reference = client.GetTableReference(dest_table)
 
-    if self.no_clobber:
+    if self.append_table:
+      write_disposition = 'WRITE_APPEND'
+      ignore_already_exists = True
+    elif self.no_clobber:
       write_disposition = 'WRITE_EMPTY'
       ignore_already_exists = True
     else:
