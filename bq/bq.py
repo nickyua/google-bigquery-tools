@@ -92,6 +92,11 @@ flags.DEFINE_string(
     'a unique job_id. Applies only to commands that launch jobs, such as cp, '
     'extract, link, load, and query. ')
 flags.DEFINE_boolean(
+    'fingerprint_job_id', False,
+    'Whether to use a job id that is derived from a fingerprint of the job '
+    'configuration. This will prevent the same job from running multiple times '
+    'accidentally.')
+flags.DEFINE_boolean(
     'quiet', False,
     'If True, ignore status updates while jobs are running.',
     short_name='q')
@@ -146,6 +151,9 @@ ProjectReference = bigquery_client.ApiClientHelper.ProjectReference
 DatasetReference = bigquery_client.ApiClientHelper.DatasetReference
 TableReference = bigquery_client.ApiClientHelper.TableReference
 BigqueryClient = bigquery_client.BigqueryClient
+JobIdGeneratorIncrementing = bigquery_client.JobIdGeneratorIncrementing
+JobIdGeneratorRandom = bigquery_client.JobIdGeneratorRandom
+JobIdGeneratorFingerprint = bigquery_client.JobIdGeneratorFingerprint
 # pylint:enable-msg=C6409
 
 _CLIENT_USER_AGENT = 'bq/2.0'
@@ -379,13 +387,41 @@ def _ExpandForPrinting(fields, rows, formatter):
   return ([NormalizeEntry(i, e) for i, e in enumerate(row)] for row in rows)
 
 
-def _PrintTable(client, table_dict, **extra_args):
-  fields, rows = client.ReadSchemaAndRows(table_dict, **extra_args)
-  formatter = _GetFormatterFromFlags(secondary_format='pretty')
-  formatter.AddFields(fields)
-  rows = _ExpandForPrinting(fields, rows, formatter)
-  formatter.AddRows(rows)
-  formatter.Print()
+def _PrintDryRunInfo(job):
+  num_bytes = job['statistics']['query']['totalBytesProcessed']
+  if FLAGS.format in ['prettyjson', 'json']:
+    _PrintFormattedJsonObject(job)
+  elif FLAGS.format == 'csv':
+    print num_bytes
+  else:
+    print (
+        'Query successfully validated. Assuming the tables are not modified, '
+        'running this query will process %s bytes of data.' % (num_bytes,))
+
+
+def _PrintFormattedJsonObject(obj):
+  if FLAGS.format == 'prettyjson':
+    print json.dumps(obj, sort_keys=True, indent=2)
+  else:
+    print json.dumps(obj, separators=(',', ':'))
+
+
+def _GetJobIdFromFlags():
+  """Returns the job id or job generator from the flags."""
+  if FLAGS.fingerprint_job_id and FLAGS.job_id:
+    raise app.UsageError(
+        'The fingerprint_job_id flag cannot be specified with the job_id '
+        'flag.')
+  if FLAGS.fingerprint_job_id:
+    return JobIdGeneratorFingerprint()
+  elif FLAGS.job_id is None:
+    return JobIdGeneratorIncrementing(JobIdGeneratorRandom())
+  elif FLAGS.job_id:
+    return FLAGS.job_id
+  else:
+    # User specified a job id, but it was empty. Let the
+    # server come up with a job id.
+    return None
 
 
 def _GetWaitPrinterFactoryFromFlags():
@@ -436,6 +472,61 @@ def _NormalizeFieldDelimiter(field_delimiter):
   return _DELIMITER_MAP.get(key, field_delimiter)
 
 
+class TablePrinter(object):
+  """Base class for printing a table, with a default implementation."""
+
+  def __init__(self, **kwds):
+    super(TablePrinter, self).__init__()
+    # Most extended classes will require state.
+    for key, value in kwds.iteritems():
+      setattr(self, key, value)
+
+  def PrintTable(self, fields, rows):
+    formatter = _GetFormatterFromFlags(secondary_format='pretty')
+    formatter.AddFields(fields)
+    rows = _ExpandForPrinting(fields, rows, formatter)
+    formatter.AddRows(rows)
+    formatter.Print()
+
+
+class Factory(object):
+  """Class encapsulating factory creation of BigqueryClient."""
+  _BIGQUERY_CLIENT_FACTORY = None
+
+  class ClientTablePrinter(object):
+    _TABLE_PRINTER = None
+
+    @classmethod
+    def GetTablePrinter(cls):
+      if cls._TABLE_PRINTER is None:
+        cls._TABLE_PRINTER = TablePrinter()
+      return cls._TABLE_PRINTER
+
+    @classmethod
+    def SetTablePrinter(cls, printer):
+      if not isinstance(printer, TablePrinter):
+        raise TypeError('Printer must be an instance of TablePrinter.')
+      cls._TABLE_PRINTER = printer
+
+  @classmethod
+  def GetBigqueryClientFactory(cls):
+    if cls._BIGQUERY_CLIENT_FACTORY is None:
+      cls._BIGQUERY_CLIENT_FACTORY = bigquery_client.BigqueryClient
+    return cls._BIGQUERY_CLIENT_FACTORY
+
+  @classmethod
+  def SetBigqueryClientFactory(cls, factory):
+    if not issubclass(factory, bigquery_client.BigqueryClient):
+      raise TypeError('Factory must be subclass of BigqueryClient.')
+    cls._BIGQUERY_CLIENT_FACTORY = factory
+
+
+def _PrintTable(client, table_dict, **extra_args):
+  fields, rows = client.ReadSchemaAndRows(table_dict, **extra_args)
+  printer = Factory.ClientTablePrinter.GetTablePrinter()
+  printer.PrintTable(fields, rows)
+
+
 class Client(object):
   """Class wrapping a singleton bigquery_client.BigqueryClient."""
   client = None
@@ -463,7 +554,8 @@ class Client(object):
     if FLAGS.discovery_file:
       with open(FLAGS.discovery_file) as f:
         client_args['discovery_document'] = f.read()
-    return BigqueryClient(credentials=credentials, **client_args)
+    bigquery_client_factory = Factory.GetBigqueryClientFactory()
+    return bigquery_client_factory(credentials=credentials, **client_args)
 
   @classmethod
   def Get(cls):
@@ -504,7 +596,7 @@ class NewCmd(appcommands.Cmd):
     self._new_style = isinstance(run_with_args, types.MethodType)
     if self._new_style:
       func = run_with_args.im_func
-      code = func.func_code
+      code = func.func_code  # pylint: disable=W0621
       self._full_arg_list = list(code.co_varnames[:code.co_argcount])
       # TODO(user): There might be some corner case where this
       # is *not* the right way to determine bound vs. unbound method.
@@ -867,7 +959,7 @@ class _Load(BigqueryCmd):
         'skip_leading_rows': self.skip_leading_rows,
         'max_bad_records': self.max_bad_records,
         'allow_quoted_newlines': self.allow_quoted_newlines,
-        'job_id': FLAGS.job_id,
+        'job_id': _GetJobIdFromFlags(),
         'source_format': self.source_format,
         }
     if self.replace:
@@ -903,6 +995,26 @@ class _Query(BigqueryCmd):
         'append_table', False,
         'When a destination table is specified, whether or not to append.',
         flag_values=fv)
+    flags.DEFINE_boolean(
+        'replace', False,
+        'If true erase existing contents before loading new data.',
+        flag_values=fv)
+    flags.DEFINE_boolean(
+        'allow_large_results', False,
+        'Whether to materialize large results in the destination table.',
+        flag_values=fv)
+    flags.DEFINE_boolean(
+        'dry_run', None,
+        'Whether the query should be validated without executing.',
+        flag_values=fv)
+    flags.DEFINE_boolean(
+        'require_cache', None,
+        'Whether to only run the query if it is already cached.',
+        flag_values=fv)
+    flags.DEFINE_boolean(
+        'use_cache', None,
+        'Whether to use the query cache to avoid rerunning cached queries.',
+        flag_values=fv)
 
   def RunWithArgs(self, *args):
     """Execute a query.
@@ -915,17 +1027,27 @@ class _Query(BigqueryCmd):
     """
     kwds = {
         'destination_table': self.destination_table,
-        'job_id': FLAGS.job_id,
+        'job_id': _GetJobIdFromFlags(),
         'preserve_nulls': True,
+        'allow_large_results': self.allow_large_results,
+        'dry_run': self.dry_run,
+        'use_cache': self.use_cache,
         }
     if self.destination_table and self.append_table:
       kwds['write_disposition'] = 'WRITE_APPEND'
+
+    if self.destination_table and self.replace:
+      kwds['write_disposition'] = 'WRITE_TRUNCATE'
+    if self.require_cache:
+      kwds['create_disposition'] = 'CREATE_NEVER'
 
     if self.batch:
       kwds['priority'] = 'BATCH'
     client = Client.Get()
     job = client.Query(' '.join(args), **kwds)
-    if not FLAGS.sync:
+    if self.dry_run:
+      _PrintDryRunInfo(job)
+    elif not FLAGS.sync:
       self.PrintJobStartInfo(job)
     else:
       _PrintTable(client, job['configuration']['query']['destinationTable'],
@@ -964,7 +1086,7 @@ class _Extract(BigqueryCmd):
     """
     client = Client.Get()
     kwds = {
-        'job_id': FLAGS.job_id,
+        'job_id': _GetJobIdFromFlags(),
         }
     table_reference = client.GetTableReference(source_table)
     job = client.Extract(
@@ -1202,7 +1324,7 @@ class _Copy(BigqueryCmd):
     kwds = {
         'write_disposition': write_disposition,
         'ignore_already_exists': ignore_already_exists,
-        'job_id': FLAGS.job_id,
+        'job_id': _GetJobIdFromFlags(),
         }
     job = client.CopyTable(source_reference, dest_reference, **kwds)
     if job is None:
@@ -1415,10 +1537,8 @@ class _Show(BigqueryCmd):
 
     # The JSON formats are handled separately so that they don't print
     # the record as a list of one record.
-    if FLAGS.format == 'prettyjson':
-      print json.dumps(object_info, sort_keys=True, indent=2)
-    elif FLAGS.format == 'json':
-      print json.dumps(object_info, separators=(',', ':'))
+    if FLAGS.format in ['prettyjson', 'json']:
+      _PrintFormattedJsonObject(object_info)
     elif FLAGS.format in [None, 'sparse', 'pretty']:
       formatter = _GetFormatterFromFlags()
       BigqueryClient.ConfigureFormatter(
@@ -1443,7 +1563,7 @@ class _Show(BigqueryCmd):
 
 
 class _Head(BigqueryCmd):
-  usage = """head [-n <max rows>] [<table identifier>]"""
+  usage = """head [-n <max rows>] <table identifier>"""
 
   def __init__(self, name, fv):
     super(_Head, self).__init__(name, fv)
@@ -1461,9 +1581,11 @@ class _Head(BigqueryCmd):
     """
     client = Client.Get()
     reference = client.GetReference(identifier)
-    _Typecheck(reference, (types.NoneType, TableReference),
+    _Typecheck(reference, (TableReference,),
                'Must provide a table identifier for head.')
     _PrintTable(client, dict(reference), max_rows=self.max_rows)
+
+
 
 
 class _Wait(BigqueryCmd):
@@ -1866,21 +1988,26 @@ def main(argv):
   try:
     FLAGS.auth_local_webserver = False
 
-    appcommands.AddCmd('load', _Load)
-    appcommands.AddCmd('query', _Query)
-    appcommands.AddCmd('extract', _Extract)
-    appcommands.AddCmd('ls', _List)
-    appcommands.AddCmd('rm', _Delete)
-    appcommands.AddCmd('mk', _Make)
-    appcommands.AddCmd('show', _Show)
-    appcommands.AddCmd('head', _Head)
-    appcommands.AddCmd('wait', _Wait)
-    appcommands.AddCmd('cp', _Copy)
-    appcommands.AddCmd('update', _Update)
+    bq_commands = {
+        'load': _Load,
+        'query': _Query,
+        'extract': _Extract,
+        'ls': _List,
+        'rm': _Delete,
+        'mk': _Make,
+        'show': _Show,
+        'head': _Head,
+        'wait': _Wait,
+        'cp': _Copy,
+        'update': _Update,
+        'version': _Version,
+        'shell': _Repl,
+        'init': _Init,
+    }
 
-    appcommands.AddCmd('version', _Version)
-    appcommands.AddCmd('shell', _Repl)
-    appcommands.AddCmd('init', _Init)
+    for command, function in bq_commands.iteritems():
+      if command not in appcommands.GetCommandList():
+        appcommands.AddCmd(command, function)
 
     if (not argv or
         (len(argv) > 1 and

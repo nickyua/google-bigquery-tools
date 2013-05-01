@@ -5,12 +5,15 @@
 
 
 
+import abc
 import datetime
+import hashlib
 import itertools
 import json
 import logging
 import os
 import pkgutil
+import random
 import re
 import string
 import sys
@@ -93,6 +96,8 @@ def ConfigurePythonLogger(apilog=None):
       logging.basicConfig(level=logging.INFO)
     # Turn on apiclient logging of http requests and responses.
     flags.FLAGS.dump_request_response = True
+
+
 
 
 class BigqueryError(Exception):
@@ -286,6 +291,73 @@ class BigqueryHttp(http_request.HttpRequest):
                  e.resp.get('status', '(unexpected)'), e.content))
 
 
+class JobIdGenerator(object):
+  """Base class for job id generators."""
+  __metaclass__ = abc.ABCMeta
+
+  @abc.abstractmethod
+  def Generate(self, job_configuration):
+    """Generates a job_id to use for job_configuration."""
+
+
+class JobIdGeneratorNone(JobIdGenerator):
+  """Job id generator that returns None, letting the server pick the job id."""
+
+  def Generate(self, unused_config):
+    return None
+
+
+class JobIdGeneratorRandom(JobIdGenerator):
+  """Generates random job ids."""
+
+  def Generate(self, unused_config):
+    return 'bqjob_r%08x_%016x' % (random.randint(0, sys.maxint),
+                                  int(time.time() * 1000))
+
+
+class JobIdGeneratorFingerprint(JobIdGenerator):
+  """Generates job ids that uniquely match the job config."""
+
+  def _Hash(self, config, sha1):
+    """Computes the sha1 hash of a dict."""
+    keys = config.keys()
+    # Python dict enumeration ordering is random. Sort the keys
+    # so that we will visit them in a stable order.
+    keys.sort()
+    for key in keys:
+      sha1.update('%s' % (key,))
+      v = config[key]
+      if isinstance(v, dict):
+        logging.info('Hashing: %s...', key)
+        self._Hash(v, sha1)
+      elif isinstance(v, list):
+        logging.info('Hashing: %s ...', key)
+        for inner_v in v:
+          self._Hash(inner_v, sha1)
+      else:
+        logging.info('Hashing: %s:%s', key, v)
+        sha1.update('%s' % (v,))
+
+  def Generate(self, config):
+    s1 = hashlib.sha1()
+    self._Hash(config, s1)
+    job_id = 'bqjob_c%s' % (s1.hexdigest(),)
+    logging.info('Fingerprinting: %s:\n%s', config, job_id)
+    return job_id
+
+
+class JobIdGeneratorIncrementing(JobIdGenerator):
+  """Generates job ids that increment each time we're asked."""
+
+  def __init__(self, inner):
+    self._inner = inner
+    self._retry = 0
+
+  def Generate(self, config):
+    self._retry += 1
+    return '%s_%d' % (self._inner.Generate(config), self._retry)
+
+
 class BigqueryClient(object):
   """Class encapsulating interaction with the BigQuery service."""
 
@@ -333,6 +405,7 @@ class BigqueryClient(object):
         'trace': None,
         'sync': True,
         'wait_printer_factory': BigqueryClient.TransitionWaitPrinter,
+        'job_id_generator': JobIdGeneratorIncrementing(JobIdGeneratorRandom()),
         }
     for flagname, default in default_flag_values.iteritems():
       if not hasattr(self, flagname):
@@ -652,6 +725,7 @@ class BigqueryClient(object):
             'Not enough rows returned by server for %r' % (
                 ApiClientHelper.TableReference.Create(**table_dict),))
     return rows
+
 
   def ReadSchemaAndRows(self, table_dict, max_rows=sys.maxint):
     """Convenience method to get the schema and rows from a table.
@@ -1314,11 +1388,14 @@ class BigqueryClient(object):
         self.project_id is used.
       upload_file: A file to include as a media upload to this request.
         Only valid on job requests that expect a media upload file.
-      job_id: A unique job_id to use for this job. If None, the server
-        will create a unique job_id for this request.
+      job_id: A unique job_id to use for this job. If a
+        JobIdGenerator, a job id will be generated from the job configuration.
+        If None, a unique job_id will be created for this request.
 
     Returns:
-      The job resource returned from the insert job request.
+      The job resource returned from the insert job request. If there is an
+      error, the jobReference field will still be filled out with the job
+      reference used in the request.
 
     Raises:
       BigqueryClientConfigurationError: if project_id and
@@ -1333,8 +1410,16 @@ class BigqueryClient(object):
       configuration['properties'] = dict(
           prop.partition('=')[0::2] for prop in self.job_property)
     job_request = {'configuration': configuration}
-    if job_id:
-      job_request['jobReference'] = {'jobId': job_id}
+
+    # Use the default job id generator if no job id was supplied.
+    job_id = job_id or self.job_id_generator
+
+    if isinstance(job_id, JobIdGenerator):
+      job_id = job_id.Generate(configuration)
+
+    if job_id is not None:
+      job_reference = {'jobId': job_id, 'projectId': project_id}
+      job_request['jobReference'] = job_reference
     media_upload = ''
     if upload_file:
       resumable = True
@@ -1350,8 +1435,9 @@ class BigqueryClient(object):
                           upload_file=None, job_id=None):
     result = self.StartJob(configuration, project_id=project_id,
                            upload_file=upload_file, job_id=job_id)
-    job_reference = BigqueryClient.ConstructObjectReference(result)
-    result = self.WaitJob(job_reference)
+    if result['status']['state'] != 'DONE':
+      job_reference = BigqueryClient.ConstructObjectReference(result)
+      result = self.WaitJob(job_reference)
     return self.RaiseIfJobError(result)
 
   def ExecuteJob(self, configuration, sync=None,
@@ -1529,6 +1615,9 @@ class BigqueryClient(object):
   def Query(self, query, destination_table=None,
             create_disposition=None, write_disposition=None,
             priority=None, preserve_nulls=None,
+            allow_large_results=False,
+            dry_run=None,
+            use_cache=None,
             **kwds):
     # pylint:disable-msg=g-doc-args
     """Execute the given query, returning the created job.
@@ -1548,6 +1637,13 @@ class BigqueryClient(object):
           'INTERACTIVE' (default) or 'BATCH'.
       preserve_nulls: Optional. Indicates whether to preserve nulls in input
           data. Temporary flag; will be removed in a future version.
+      allow_large_results: (default False) If provided, enables support for
+          large (> 128M) results.
+      dry_run: Optional. Indicates whether the query will only be validated and
+          return processing statistics instead of actually running.
+      use_cache: Optional. Whether to use the query cache. If create_disposition
+          is CREATE_NEVER, will only run the query if the result is already
+          cached.
       **kwds: Passed on to self.ExecuteJob.
 
     Raises:
@@ -1570,11 +1666,15 @@ class BigqueryClient(object):
       query_config['destinationTable'] = dict(reference)
     _ApplyParameters(
         query_config,
+        allow_large_results=allow_large_results,
         create_disposition=create_disposition,
         preserve_nulls=preserve_nulls,
         priority=priority,
-        write_disposition=write_disposition)
-    return self.ExecuteJob({'query': query_config}, **kwds)
+        write_disposition=write_disposition,
+        use_query_cache=use_cache)
+    request = {'query': query_config}
+    _ApplyParameters(request, dry_run=dry_run)
+    return self.ExecuteJob(request, **kwds)
 
   def Load(self, destination_table_reference, source,
            schema=None, create_disposition=None, write_disposition=None,
@@ -1607,7 +1707,7 @@ class BigqueryClient(object):
       allow_quoted_newlines: Optional. Whether to allow quoted newlines in csv
           import data.
       source_format: Optional. Format of source data. May be "CSV",
-         "DATASTORE_BACKUP", or "NEWLINE_DELIMITED_JSON".
+          "DATASTORE_BACKUP", or "NEWLINE_DELIMITED_JSON".
       **kwds: Passed on to self.ExecuteJob.
 
     Returns:
@@ -1632,6 +1732,7 @@ class BigqueryClient(object):
         allow_quoted_newlines=allow_quoted_newlines)
     return self.ExecuteJob(configuration={'load': load_config},
                            upload_file=upload_file, **kwds)
+
 
   def Extract(self, source_table, destination_uri,
               print_header=None, field_delimiter=None,
