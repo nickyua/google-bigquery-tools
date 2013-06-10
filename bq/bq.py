@@ -28,6 +28,7 @@ import httplib2
 import oauth2client
 import oauth2client.client
 import oauth2client.file
+import oauth2client.gce
 import oauth2client.tools
 
 from google.apputils import app
@@ -123,6 +124,11 @@ flags.DEFINE_multistring(
     'job_property', None,
     'Additional key-value pairs to include in the properties field of '
     'the job configuration')  # No period: Multistring adds flagspec suffix.
+flags.DEFINE_boolean(
+    'use_gce_service_account', False,
+    'Use this when running on a Google Compute Engine instance to use service '
+    'account credentials instead of stored credentials. For more information, '
+    'see: https://developers.google.com/compute/docs/authentication')
 flags.DEFINE_string(
     'service_account', '',
     'Use this service account email address for authorization. '
@@ -192,6 +198,13 @@ _DELIMITER_MAP = {
 
 
 
+def _ValidateGlobalFlags():
+  """Validate combinations of global flag values."""
+  if FLAGS.service_account and FLAGS.use_gce_service_account:
+    raise app.UsageError(
+        'Cannot specify both --service_account and --use_gce_service_account.')
+
+
 def _GetBigqueryRcFilename():
   """Return the name of the bigqueryrc file to use.
 
@@ -246,7 +259,14 @@ def _ResolveApiInfoFromFlags():
   return {'api': api, 'api_version': api_version}
 
 
+def _UseServiceAccount():
+  return bool(FLAGS.use_gce_service_account or FLAGS.service_account)
+
+
 def _GetServiceAccountCredentialsFromFlags(storage):  # pylint:disable-msg=W0613
+  if FLAGS.use_gce_service_account:
+    return oauth2client.gce.AppAssertionCredentials(_CLIENT_SCOPE)
+
   if not oauth2client.client.HAS_OPENSSL:
     raise app.UsageError(
         'BigQuery requires OpenSSL to be installed in order to use '
@@ -310,6 +330,11 @@ def _GetCredentialsFromOAuthFlow(storage):
 
 
 def _GetCredentialsFromFlags():
+  # In the case of a GCE service account, we can skip the entire
+  # process of loading from storage.
+  if FLAGS.use_gce_service_account:
+    return _GetServiceAccountCredentialsFromFlags(None)
+
 
   if FLAGS.service_account:
     credentials_getter = _GetServiceAccountCredentialsFromFlags
@@ -900,6 +925,11 @@ class _Load(BigqueryCmd):
         'allow_quoted_newlines', None,
         'Whether to allow quoted newlines in CSV import data.',
         flag_values=fv)
+    flags.DEFINE_boolean(
+        'allow_jagged_rows', None,
+        'Whether to allow missing trailing optional columns '
+        'in CSV import data.',
+        flag_values=fv)
     flags.DEFINE_enum(
         'source_format', None,
         ['CSV',
@@ -968,7 +998,8 @@ class _Load(BigqueryCmd):
       opts['field_delimiter'] = _NormalizeFieldDelimiter(self.field_delimiter)
     if self.quote is not None:
       opts['quote'] = _NormalizeFieldDelimiter(self.quote)
-
+    if self.allow_jagged_rows is not None:
+      opts['allow_jagged_rows'] = self.allow_jagged_rows
     job = client.Load(table_reference, source, schema=schema, **opts)
     if not FLAGS.sync:
       self.PrintJobStartInfo(job)
@@ -1000,8 +1031,8 @@ class _Query(BigqueryCmd):
         'If true erase existing contents before loading new data.',
         flag_values=fv)
     flags.DEFINE_boolean(
-        'allow_large_results', False,
-        'Whether to materialize large results in the destination table.',
+        'allow_large_results', None,
+        'Enables larger destination table sizes.',
         flag_values=fv)
     flags.DEFINE_boolean(
         'dry_run', None,
@@ -1028,21 +1059,19 @@ class _Query(BigqueryCmd):
     kwds = {
         'destination_table': self.destination_table,
         'job_id': _GetJobIdFromFlags(),
-        'preserve_nulls': True,
         'allow_large_results': self.allow_large_results,
         'dry_run': self.dry_run,
         'use_cache': self.use_cache,
         }
     if self.destination_table and self.append_table:
       kwds['write_disposition'] = 'WRITE_APPEND'
-
     if self.destination_table and self.replace:
       kwds['write_disposition'] = 'WRITE_TRUNCATE'
     if self.require_cache:
       kwds['create_disposition'] = 'CREATE_NEVER'
-
     if self.batch:
       kwds['priority'] = 'BATCH'
+
     client = Client.Get()
     job = client.Query(' '.join(args), **kwds)
     if self.dry_run:
@@ -1987,6 +2016,7 @@ class _Version(BigqueryCmd):
 def main(argv):
   try:
     FLAGS.auth_local_webserver = False
+    _ValidateGlobalFlags()
 
     bq_commands = {
         'load': _Load,
@@ -2015,7 +2045,7 @@ def main(argv):
          argv[1] in appcommands.GetCommandList())):
       # Service Accounts don't use cached oauth credentials and
       # all bigqueryrc defaults are technically optional.
-      if not FLAGS.service_account:
+      if not _UseServiceAccount():
         if not (os.path.exists(_GetBigqueryRcFilename()) or
                 os.path.exists(FLAGS.credential_file)):
           appcommands.GetCommandByName('init').Run([])

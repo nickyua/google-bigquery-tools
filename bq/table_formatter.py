@@ -334,7 +334,7 @@ class PrettyFormatter(TableFormatter):
     column_alignments = column_alignments or self.column_alignments
     column_widths = column_widths or self.column_widths
 
-    # pylint:disable-msg=C6402
+    # pylint: disable=g-long-lambda
     curried_format = lambda entry, width, align: self.__class__.FormatCell(
         unicode(entry), width, cell_height=row_height, align=align)
     printed_rows = itertools.izip(*itertools.imap(

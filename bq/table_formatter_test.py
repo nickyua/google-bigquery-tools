@@ -63,7 +63,7 @@ class PrettyFormatterTest(TableFormatterTest):
 
   def setUp(self):
     # Static method names are too long without abbreviations.
-    self.PF = table_formatter.PrettyFormatter  # pylint:disable-msg=C6409
+    self.PF = table_formatter.PrettyFormatter  # pylint: disable=g-bad-name
     self.format_class = self.PF
     super(PrettyFormatterTest, self).setUp()
 

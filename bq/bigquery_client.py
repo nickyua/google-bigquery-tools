@@ -1612,10 +1612,13 @@ class BigqueryClient(object):
     job = self.Query(**new_kwds)
     return self.ReadTableRows(job['configuration']['query']['destinationTable'])
 
-  def Query(self, query, destination_table=None,
-            create_disposition=None, write_disposition=None,
-            priority=None, preserve_nulls=None,
-            allow_large_results=False,
+  def Query(self, query,
+            destination_table=None,
+            create_disposition=None,
+            write_disposition=None,
+            priority=None,
+            preserve_nulls=None,
+            allow_large_results=None,
             dry_run=None,
             use_cache=None,
             **kwds):
@@ -1637,13 +1640,13 @@ class BigqueryClient(object):
           'INTERACTIVE' (default) or 'BATCH'.
       preserve_nulls: Optional. Indicates whether to preserve nulls in input
           data. Temporary flag; will be removed in a future version.
-      allow_large_results: (default False) If provided, enables support for
-          large (> 128M) results.
+      allow_large_results: Enables larger destination table sizes.
       dry_run: Optional. Indicates whether the query will only be validated and
           return processing statistics instead of actually running.
       use_cache: Optional. Whether to use the query cache. If create_disposition
           is CREATE_NEVER, will only run the query if the result is already
-          cached.
+          cached. Caching is best-effort only and you should not make
+          assumptions about whether or how long a query result will be cached.
       **kwds: Passed on to self.ExecuteJob.
 
     Raises:
@@ -1680,7 +1683,7 @@ class BigqueryClient(object):
            schema=None, create_disposition=None, write_disposition=None,
            field_delimiter=None, skip_leading_rows=None, encoding=None,
            quote=None, max_bad_records=None, allow_quoted_newlines=None,
-           source_format=None,
+           source_format=None, allow_jagged_rows=None,
            **kwds):
     """Load the given data into BigQuery.
 
@@ -1708,6 +1711,8 @@ class BigqueryClient(object):
           import data.
       source_format: Optional. Format of source data. May be "CSV",
           "DATASTORE_BACKUP", or "NEWLINE_DELIMITED_JSON".
+      allow_jagged_rows: Optional. Whether to allow missing trailing optional
+          columns in csv import data.
       **kwds: Passed on to self.ExecuteJob.
 
     Returns:
@@ -1729,7 +1734,8 @@ class BigqueryClient(object):
         skip_leading_rows=skip_leading_rows, encoding=encoding,
         quote=quote, max_bad_records=max_bad_records,
         source_format=source_format,
-        allow_quoted_newlines=allow_quoted_newlines)
+        allow_quoted_newlines=allow_quoted_newlines,
+        allow_jagged_rows=allow_jagged_rows)
     return self.ExecuteJob(configuration={'load': load_config},
                            upload_file=upload_file, **kwds)
 

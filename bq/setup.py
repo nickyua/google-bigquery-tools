@@ -20,7 +20,7 @@ import platform
 
 from ez_setup import use_setuptools
 use_setuptools()
-from setuptools import setup  # pylint:disable-msg=C6204
+from setuptools import setup  # pylint: disable=g-import-not-at-top
 
 # Configure the required packages and scripts to install, depending on
 # Python version and OS.
@@ -42,7 +42,7 @@ py_version = platform.python_version()
 if py_version < '2.6.5' or py_version >= '3':
   raise ValueError('BigQuery requires Python >= 2.6.5.')
 
-_BQ_VERSION = '2.0.13'
+_BQ_VERSION = '2.0.14'
 
 setup(name='bigquery',
       version=_BQ_VERSION,
