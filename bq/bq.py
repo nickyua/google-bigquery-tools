@@ -89,9 +89,9 @@ flags.DEFINE_string(
 # text on individual commands for rarely used functionality.
 flags.DEFINE_string(
     'job_id', None,
-    'A unique job_id to use for the request. If None, the server will create '
-    'a unique job_id. Applies only to commands that launch jobs, such as cp, '
-    'extract, link, load, and query. ')
+    'A unique job_id to use for the request. If not specified, this client '
+    'will generate a job_id. Applies only to commands that launch jobs, '
+    'such as cp, extract, link, load, and query.')
 flags.DEFINE_boolean(
     'fingerprint_job_id', False,
     'Whether to use a job id that is derived from a fingerprint of the job '
@@ -151,7 +151,7 @@ flags.DEFINE_string(
 
 FLAGS = flags.FLAGS
 # These are long names.
-# pylint:disable-msg=C6409
+# pylint: disable=g-bad-name
 JobReference = bigquery_client.ApiClientHelper.JobReference
 ProjectReference = bigquery_client.ApiClientHelper.ProjectReference
 DatasetReference = bigquery_client.ApiClientHelper.DatasetReference
@@ -160,9 +160,27 @@ BigqueryClient = bigquery_client.BigqueryClient
 JobIdGeneratorIncrementing = bigquery_client.JobIdGeneratorIncrementing
 JobIdGeneratorRandom = bigquery_client.JobIdGeneratorRandom
 JobIdGeneratorFingerprint = bigquery_client.JobIdGeneratorFingerprint
-# pylint:enable-msg=C6409
+# pylint: enable=g-bad-name
 
-_CLIENT_USER_AGENT = 'bq/2.0'
+
+def _VersionNumberReleased():
+  """Return the released version of bq."""
+  try:
+    import pkg_resources  # pylint: disable=g-import-not-at-top
+    version = pkg_resources.get_distribution('bigquery').version
+    return 'v%s' % (version,)
+  except ImportError:
+    return '<unknown>'
+
+
+
+
+def _VersionNumber():
+  """Return the version of bq."""
+  return _VersionNumberReleased()
+
+
+_CLIENT_USER_AGENT = 'bq/' + _VersionNumber()
 _CLIENT_SCOPE = [
     'https://www.googleapis.com/auth/bigquery',
 ]
@@ -188,8 +206,8 @@ _DELIMITER_MAP = {
     }
 
 # These aren't relevant for user-facing docstrings:
-# pylint:disable-msg=C6112
-# pylint:disable-msg=C6113
+# pylint: disable=g-doc-return-or-yield
+# pylint: disable=g-doc-args
 # TODO(user): Write some explanation of the structure of this file.
 
 ####################
@@ -263,7 +281,7 @@ def _UseServiceAccount():
   return bool(FLAGS.use_gce_service_account or FLAGS.service_account)
 
 
-def _GetServiceAccountCredentialsFromFlags(storage):  # pylint:disable-msg=W0613
+def _GetServiceAccountCredentialsFromFlags(storage):  # pylint: disable=unused-argument
   if FLAGS.use_gce_service_account:
     return oauth2client.gce.AppAssertionCredentials(_CLIENT_SCOPE)
 
@@ -546,12 +564,6 @@ class Factory(object):
     cls._BIGQUERY_CLIENT_FACTORY = factory
 
 
-def _PrintTable(client, table_dict, **extra_args):
-  fields, rows = client.ReadSchemaAndRows(table_dict, **extra_args)
-  printer = Factory.ClientTablePrinter.GetTablePrinter()
-  printer.PrintTable(fields, rows)
-
-
 class Client(object):
   """Class wrapping a singleton bigquery_client.BigqueryClient."""
   client = None
@@ -603,7 +615,7 @@ class Client(object):
     cls.client = None
 
 
-def _Typecheck(obj, types, message=None):  # pylint:disable-msg=W0621
+def _Typecheck(obj, types, message=None):  # pylint: disable=redefined-outer-name
   """Raises a user error if obj is not an instance of types."""
   if not isinstance(obj, types):
     message = message or 'Type of %s is not one of %s' % (obj, types)
@@ -621,7 +633,7 @@ class NewCmd(appcommands.Cmd):
     self._new_style = isinstance(run_with_args, types.MethodType)
     if self._new_style:
       func = run_with_args.im_func
-      code = func.func_code  # pylint: disable=W0621
+      code = func.func_code  # pylint: disable=redefined-outer-name
       self._full_arg_list = list(code.co_varnames[:code.co_argcount])
       # TODO(user): There might be some corner case where this
       # is *not* the right way to determine bound vs. unbound method.
@@ -808,7 +820,7 @@ class BigqueryCmd(NewCmd):
                 platform.python_implementation(),
                 platform.python_version(),
                 platform.platform()]),
-            _Version.VersionNumber(),
+            _VersionNumber(),
             sys.argv,
             time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()),
             ''.join(traceback.format_tb(sys.exc_info()[2]))
@@ -837,7 +849,7 @@ class BigqueryCmd(NewCmd):
       response.append('Error parsing command: %s' % (message,))
     elif isinstance(e, KeyboardInterrupt):
       response.append('')
-    else:  # pylint:disable-msg=W0703
+    else:  # pylint: disable=broad-except
       # Errors with traceback information are printed here.
       # The traceback module has nicely formatted the error trace
       # for us, so we don't want to undo that via TextWrap.
@@ -1027,8 +1039,12 @@ class _Query(BigqueryCmd):
         'When a destination table is specified, whether or not to append.',
         flag_values=fv)
     flags.DEFINE_boolean(
+        'rpc', False,
+        'If true, use rpc-style query API instead of jobs.insert().',
+        flag_values=fv)
+    flags.DEFINE_boolean(
         'replace', False,
-        'If true erase existing contents before loading new data.',
+        'If true, erase existing contents before loading new data.',
         flag_values=fv)
     flags.DEFINE_boolean(
         'allow_large_results', None,
@@ -1046,6 +1062,13 @@ class _Query(BigqueryCmd):
         'use_cache', None,
         'Whether to use the query cache to avoid rerunning cached queries.',
         flag_values=fv)
+    flags.DEFINE_float(
+        'min_completion_ratio', None,
+        '[Experimental] The minimum fraction of data that must be scanned '
+        'before a query returns. If not set, the default server value (1.0) '
+        'will be used.',
+        lower_bound=0, upper_bound=1.0,
+        flag_values=fv)
 
   def RunWithArgs(self, *args):
     """Execute a query.
@@ -1056,31 +1079,53 @@ class _Query(BigqueryCmd):
     Usage:
       query <sql_query>
     """
+    # Set up the params that are the same for rpc-style and jobs.insert()-style
+    # queries.
     kwds = {
-        'destination_table': self.destination_table,
-        'job_id': _GetJobIdFromFlags(),
-        'allow_large_results': self.allow_large_results,
         'dry_run': self.dry_run,
         'use_cache': self.use_cache,
+        'min_completion_ratio': self.min_completion_ratio,
         }
-    if self.destination_table and self.append_table:
-      kwds['write_disposition'] = 'WRITE_APPEND'
-    if self.destination_table and self.replace:
-      kwds['write_disposition'] = 'WRITE_TRUNCATE'
-    if self.require_cache:
-      kwds['create_disposition'] = 'CREATE_NEVER'
-    if self.batch:
-      kwds['priority'] = 'BATCH'
-
+    query = ' '.join(args)
     client = Client.Get()
-    job = client.Query(' '.join(args), **kwds)
-    if self.dry_run:
-      _PrintDryRunInfo(job)
-    elif not FLAGS.sync:
-      self.PrintJobStartInfo(job)
+    if self.rpc:
+      if self.allow_large_results:
+        raise app.UsageError(
+            'allow_large_results cannot be specified in rpc mode.')
+      if self.destination_table:
+        raise app.UsageError(
+            'destination_table cannot be specified in rpc mode.')
+      if FLAGS.job_id or FLAGS.fingerprint_job_id:
+        raise app.UsageError(
+            'job_id and fingerprint_job_id cannot be specified in rpc mode.')
+      if self.batch:
+        raise app.UsageError(
+            'batch cannot be specified in rpc mode.')
+      kwds['max_results'] = self.max_rows
+      fields, rows = client.RunQueryRpc(query, **kwds)
+      Factory.ClientTablePrinter.GetTablePrinter().PrintTable(fields, rows)
     else:
-      _PrintTable(client, job['configuration']['query']['destinationTable'],
-                  max_rows=self.max_rows)
+      if self.destination_table and self.append_table:
+        kwds['write_disposition'] = 'WRITE_APPEND'
+      if self.destination_table and self.replace:
+        kwds['write_disposition'] = 'WRITE_TRUNCATE'
+      if self.require_cache:
+        kwds['create_disposition'] = 'CREATE_NEVER'
+      if self.batch:
+        kwds['priority'] = 'BATCH'
+
+      kwds['destination_table'] = self.destination_table
+      kwds['allow_large_results'] = self.allow_large_results
+      kwds['job_id'] = _GetJobIdFromFlags()
+      job = client.Query(query, **kwds)
+      if self.dry_run:
+        _PrintDryRunInfo(job)
+      elif not FLAGS.sync:
+        self.PrintJobStartInfo(job)
+      else:
+        fields, rows = client.ReadSchemaAndJobRows(job['jobReference'],
+                                                   max_rows=self.max_rows)
+        Factory.ClientTablePrinter.GetTablePrinter().PrintTable(fields, rows)
 
 
 class _Extract(BigqueryCmd):
@@ -1166,7 +1211,7 @@ class _List(BigqueryCmd):
       bq ls -p -n 1000
       bq ls mydataset
     """
-    # pylint:disable-msg=C6115
+    # pylint: disable=g-doc-exception
     if self.j and self.p:
       raise app.UsageError(
           'Cannot specify more than one of -j and -p.')
@@ -1207,24 +1252,24 @@ class _List(BigqueryCmd):
                  'Cannot determine job(s) associated with "%s"' % (identifier,))
       project_reference = client.GetProjectReference(identifier)
       BigqueryClient.ConfigureFormatter(formatter, JobReference)
-      results = map(  # pylint:disable-msg=C6402
+      results = map(  # pylint: disable=g-long-lambda
           client.FormatJobInfo,
           client.ListJobs(reference=project_reference,
                           max_results=self.max_results,
                           all_users=self.a))
     elif self.p or reference is None:
       BigqueryClient.ConfigureFormatter(formatter, ProjectReference)
-      results = map(  # pylint:disable-msg=C6402
+      results = map(  # pylint: disable=g-long-lambda
           client.FormatProjectInfo,
           client.ListProjects(max_results=self.max_results))
     elif isinstance(reference, ProjectReference):
       BigqueryClient.ConfigureFormatter(formatter, DatasetReference)
-      results = map(  # pylint:disable-msg=C6402
+      results = map(  # pylint: disable=g-long-lambda
           client.FormatDatasetInfo,
           client.ListDatasets(reference, max_results=self.max_results))
     else:  # isinstance(reference, DatasetReference):
       BigqueryClient.ConfigureFormatter(formatter, TableReference)
-      results = map(  # pylint:disable-msg=C6402
+      results = map(  # pylint: disable=g-long-lambda
           client.FormatTableInfo,
           client.ListTables(reference, max_results=self.max_results))
 
@@ -1271,7 +1316,7 @@ class _Delete(BigqueryCmd):
     """
     client = Client.Get()
 
-    # pylint:disable-msg=C6115
+    # pylint: disable=g-doc-exception
     if self.d and self.t:
       raise app.UsageError('Cannot specify more than one of -d and -t.')
     if not identifier:
@@ -1397,7 +1442,7 @@ class _Make(BigqueryCmd):
         flag_values=fv)
 
   def RunWithArgs(self, identifier='', schema=''):
-    # pylint:disable-msg=C6115
+    # pylint: disable=g-doc-exception
     """Create a dataset or table with this name.
 
     See 'bq help load' for more information on specifying the schema.
@@ -1485,7 +1530,7 @@ class _Update(BigqueryCmd):
         flag_values=fv)
 
   def RunWithArgs(self, identifier='', schema=''):
-    # pylint:disable-msg=C6115
+    # pylint: disable=g-doc-exception
     """Updates a dataset or table with this name.
 
     See 'bq help load' for more information on specifying the schema.
@@ -1551,7 +1596,7 @@ class _Show(BigqueryCmd):
       bq show dataset
       bq show dataset.table
     """
-    # pylint:disable-msg=C6115
+    # pylint: disable=g-doc-exception
     client = Client.Get()
     if self.j:
       reference = client.GetJobReference(identifier)
@@ -1592,10 +1637,18 @@ class _Show(BigqueryCmd):
 
 
 class _Head(BigqueryCmd):
-  usage = """head [-n <max rows>] <table identifier>"""
+  usage = """head [-n <max rows>] [-j] [-t] <identifier>"""
 
   def __init__(self, name, fv):
     super(_Head, self).__init__(name, fv)
+    flags.DEFINE_boolean(
+        'job', False,
+        'Reads the results of a query job.',
+        short_name='j', flag_values=fv)
+    flags.DEFINE_boolean(
+        'table', False,
+        'Reads rows from a table.',
+        short_name='t', flag_values=fv)
     flags.DEFINE_integer(
         'max_rows', 100,
         'The number of rows to print when showing table data.',
@@ -1606,22 +1659,102 @@ class _Head(BigqueryCmd):
 
     Examples:
       bq head dataset.table
+      bq head -j job
       bq head -n 10 dataset.table
     """
     client = Client.Get()
+    if self.j and self.t:
+      raise app.UsageError('Cannot specify both -j and -t.')
+
+    if self.j:
+      reference = client.GetJobReference(identifier)
+    else:
+      reference = client.GetTableReference(identifier)
+
+    if isinstance(reference, JobReference):
+      fields, rows = client.ReadSchemaAndJobRows(dict(reference),
+                                                 max_rows=self.n)
+    elif isinstance(reference, TableReference):
+      fields, rows = client.ReadSchemaAndRows(dict(reference), max_rows=self.n)
+    else:
+      raise app.UsageError("Invalid identifier '%s' for head." % (identifier,))
+
+    Factory.ClientTablePrinter.GetTablePrinter().PrintTable(fields, rows)
+
+
+class _Insert(BigqueryCmd):
+  usage = """insert <table identifier> [file]"""
+
+  def __init__(self, name, fv):
+    super(_Insert, self).__init__(name, fv)
+    flags.DEFINE_integer(
+        'max_rows_per_request', None,
+        'Maximum number of rows to send in a single request. '
+        'If not set, sends all the rows in one request.',
+        flag_values=fv)
+
+  def RunWithArgs(self, identifier='', filename=None):
+    """Inserts rows in a table.
+
+    Inserts the records formatted as newline delimited JSON from file
+    into the specified table. If file is not specified, reads from stdin.
+    If there were any insert errors it prints the errors to stdout.
+
+    Examples:
+      bq insert dataset.table /tmp/mydata.json
+      echo '{"a":1, "b":2}' | bq insert dataset.table
+    """
+    if filename:
+      with open(filename, 'r') as json_file:
+        return self._DoInsert(identifier, json_file)
+    else:
+      return self._DoInsert(identifier, sys.stdin)
+
+  def _DoInsert(self, identifier, json_file):
+    """Insert the contents of the file into a table."""
+    client = Client.Get()
     reference = client.GetReference(identifier)
     _Typecheck(reference, (TableReference,),
-               'Must provide a table identifier for head.')
-    _PrintTable(client, dict(reference), max_rows=self.max_rows)
+               'Must provide a table identifier for insert.')
+    reference = dict(reference)
+    batch = []
+    def Flush():
+      result = client.InsertTableRows(reference, batch)
+      del batch[:]
+      return result, result.get('insertErrors', None)
+    result = {}
+    errors = None
+    lineno = 1
+    for line in json_file:
+      try:
+        batch.append(bigquery_client.JsonToInsertEntry(None, line))
+        lineno += 1
+      except bigquery_client.BigqueryClientError, e:
+        raise app.UsageError('Line %d: %s' % (lineno, str(e)))
+      if (FLAGS.max_rows_per_request and
+          len(batch) == FLAGS.max_rows_per_request):
+        result, errors = Flush()
+      if errors: break
+    if batch and errors is None:
+      result, errors = Flush()
 
-
+    if FLAGS.format in ['prettyjson', 'json']:
+      _PrintFormattedJsonObject(result)
+    elif FLAGS.format in [None, 'sparse', 'pretty']:
+      if errors:
+        for entry in result['insertErrors']:
+          entry_errors = entry['errors']
+          sys.stdout.write('record %d errors: ' % (entry['index'],))
+          for error in entry_errors:
+            print '\t%s: %s' % (error['reason'], error['message'])
+    return 1 if errors else 0
 
 
 class _Wait(BigqueryCmd):
   usage = """wait [<job_id>] [<secs>]"""
 
   def RunWithArgs(self, job_id='', secs=sys.maxint):
-    # pylint:disable-msg=C6115
+    # pylint: disable=g-doc-exception
     """Wait some number of seconds for a job to finish.
 
     Poll job_id until either (1) the job is DONE or (2) the
@@ -1657,7 +1790,7 @@ class _Wait(BigqueryCmd):
     client.WaitJob(job_reference=job_reference, wait=secs)
 
 
-# pylint:disable-msg=C6409
+# pylint: disable=g-bad-name
 class CommandLoop(cmd.Cmd):
   """Instance of cmd.Cmd built to work with NewCmd."""
 
@@ -1839,7 +1972,7 @@ class CommandLoop(cmd.Cmd):
 
   def postcmd(self, stop, line):
     return bool(stop) or line == 'EOF'
-# pylint:enable-msg=C6409
+# pylint: enable=g-bad-name
 
 
 class _Repl(BigqueryCmd):
@@ -1996,20 +2129,9 @@ class _Init(BigqueryCmd):
 class _Version(BigqueryCmd):
   usage = """version"""
 
-  @staticmethod
-  def VersionNumber():
-    """Return the version of bq."""
-    try:
-      import pkg_resources  # pylint:disable-msg=C6204
-      version = pkg_resources.get_distribution('bigquery').version
-      return 'v%s' % (version,)
-    except ImportError:
-      return '<unknown>'
-
-
   def RunWithArgs(self):
     """Return the version of bq."""
-    version = type(self).VersionNumber()
+    version = _VersionNumber()
     print 'This is BigQuery CLI %s' % (version,)
 
 
@@ -2019,20 +2141,22 @@ def main(argv):
     _ValidateGlobalFlags()
 
     bq_commands = {
-        'load': _Load,
-        'query': _Query,
-        'extract': _Extract,
-        'ls': _List,
-        'rm': _Delete,
-        'mk': _Make,
-        'show': _Show,
-        'head': _Head,
-        'wait': _Wait,
+        # Keep the commands alphabetical.
         'cp': _Copy,
+        'extract': _Extract,
+        'head': _Head,
+        'init': _Init,
+        'insert': _Insert,
+        'load': _Load,
+        'ls': _List,
+        'mk': _Make,
+        'query': _Query,
+        'rm': _Delete,
+        'shell': _Repl,
+        'show': _Show,
         'update': _Update,
         'version': _Version,
-        'shell': _Repl,
-        'init': _Init,
+        'wait': _Wait,
     }
 
     for command, function in bq_commands.iteritems():
@@ -2052,7 +2176,7 @@ def main(argv):
   except KeyboardInterrupt, e:
     print 'Control-C pressed, exiting.'
     sys.exit(1)
-  except BaseException, e:  # pylint:disable-msg=W0703
+  except BaseException, e:  # pylint: disable=broad-except
     print 'Error initializing bq client: %s' % (e,)
     if FLAGS.debug_mode or FLAGS.headless:
       traceback.print_exc()
@@ -2061,7 +2185,7 @@ def main(argv):
     sys.exit(1)
 
 
-# pylint: disable-msg=C6409
+# pylint: disable=g-bad-name
 def run_main():
   """Function to be used as setuptools script entry point.
 
@@ -2073,14 +2197,14 @@ def run_main():
 
   # Put the flags for this module somewhere the flags module will look
   # for them.
-  # pylint: disable-msg=W0212
+  # pylint: disable=protected-access
   new_name = flags._GetMainModule()
   sys.modules[new_name] = sys.modules['__main__']
   for flag in FLAGS.FlagsByModuleDict().get(__name__, []):
     FLAGS._RegisterFlagByModule(new_name, flag)
     for key_flag in FLAGS.KeyFlagsByModuleDict().get(__name__, []):
       FLAGS._RegisterKeyFlagForModule(new_name, key_flag)
-  # pylint: enable-msg=W0212
+  # pylint: enable=protected-access
 
   # Now set __main__ appropriately so that appcommands will be
   # happy.

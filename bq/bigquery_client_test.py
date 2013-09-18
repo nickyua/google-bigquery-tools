@@ -7,7 +7,6 @@
 
 import itertools
 import json
-import StringIO
 import tempfile
 
 from google.apputils import googletest
@@ -165,25 +164,23 @@ class BigqueryClientTest(googletest.TestCase):
     except bigquery_client.BigqueryError as _:
       pass
 
-  def testParseNewlineDelimitedJson(self):
-    data = '{"a":1}\n{"b":2}'
-    result = bigquery_client.ParseNewlineDelimitedJson(
-        None, StringIO.StringIO(data))
-    self.assertEquals(2, len(result))
-    self.assertEquals([None, None], [x[0] for x in result])
+  def testJsonToInsertEntry(self):
+    result = [
+        bigquery_client.JsonToInsertEntry(None, '{"a":1}'),
+        bigquery_client.JsonToInsertEntry('key', '{"b":2}'),
+        ]
+    self.assertEquals([None, 'key'], [x[0] for x in result])
     self.assertEquals(1, result[0][1]['a'])
     self.assertEquals(2, result[1][1]['b'])
-    result = bigquery_client.ParseNewlineDelimitedJson(
-        'foo/', StringIO.StringIO(data))
-    self.assertEquals(['foo/0', 'foo/8'], [x[0] for x in result])
 
-    def _Parse(s):
-      bigquery_client.ParseNewlineDelimitedJson(
-          None, StringIO.StringIO(s))
-    self.assertRaisesRegexp(bigquery_client.BigqueryClientError,
-                            r'Could not parse', _Parse, '_junk_')
-    self.assertRaisesRegexp(bigquery_client.BigqueryClientError,
-                            r'not a JSON object', _Parse, '[1, 2]')
+    self.assertRaisesRegexp(
+        bigquery_client.BigqueryClientError,
+        r'Could not parse',
+        bigquery_client.JsonToInsertEntry, None, '_junk_')
+    self.assertRaisesRegexp(
+        bigquery_client.BigqueryClientError,
+        r'not a JSON object',
+        bigquery_client.JsonToInsertEntry, None, '[1, 2]')
 
 
 if __name__ == '__main__':

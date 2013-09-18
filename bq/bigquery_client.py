@@ -6,6 +6,7 @@
 
 
 import abc
+import collections
 import datetime
 import hashlib
 import itertools
@@ -34,6 +35,9 @@ import gflags as flags
 # A unique non-None default, for use in kwargs that need to
 # distinguish default from None.
 _DEFAULT = object()
+# The max number of rows requested in a single page if no explicit
+# value is specified.
+_MAX_ROWS_PER_REQUEST = 1000000
 
 
 def _Typecheck(obj, types, message=None, method=None):
@@ -94,10 +98,35 @@ def ConfigurePythonLogger(apilog=None):
       logging.basicConfig(filename=apilog, level=logging.INFO)
     else:
       logging.basicConfig(level=logging.INFO)
-    # Turn on apiclient logging of http requests and responses.
-    flags.FLAGS.dump_request_response = True
+    # Turn on apiclient logging of http requests and responses. (Here
+    # we handle both the flags interface from apiclient < 1.2 and the
+    # module global in apiclient >= 1.2.)
+    if hasattr(flags.FLAGS, 'dump_request_response'):
+      flags.FLAGS.dump_request_response = True
+    else:
+      model.dump_request_response = True
 
 
+InsertEntry = collections.namedtuple('InsertEntry',
+                                     ['insert_id', 'record'])
+
+
+def JsonToInsertEntry(insert_id, json_string):
+  """Parses a JSON encoded record and returns an InsertEntry.
+
+  Arguments:
+    insert_id: Id for the insert, can be None.
+    json_string: The JSON encoded data to be converted.
+  Returns:
+    InsertEntry object for adding to a table.
+  """
+  try:
+    row = json.loads(json_string)
+    if not isinstance(row, dict):
+      raise BigqueryClientError('Value is not a JSON object')
+    return InsertEntry(insert_id, row)
+  except ValueError, e:
+    raise BigqueryClientError('Could not parse object: %s' % (str(e),))
 
 
 class BigqueryError(Exception):
@@ -129,9 +158,11 @@ class BigqueryError(Exception):
     if new_errors:
       message += '\nFailure details:\n'
       message += '\n'.join(
-          textwrap.fill(err.get('message', ''),
-                        initial_indent=' - ',
-                        subsequent_indent='   ')
+          textwrap.fill(
+              ': '.join(filter(None, [
+                  err.get('location', None), err.get('message', '')])),
+              initial_indent=' - ',
+              subsequent_indent='   ')
           for err in new_errors)
     if not reason or not message:
       return BigqueryInterfaceError(
@@ -248,14 +279,14 @@ class BigqueryModel(model.JsonModel):
     super(BigqueryModel, self).__init__(**kwds)
     self.trace = trace
 
-  # pylint:disable-msg=C6409
+  # pylint: disable=g-bad-name
   def request(self, headers, path_params, query_params, body_value):
     """Updates outgoing request."""
     if 'trace' not in query_params and self.trace:
       query_params['trace'] = self.trace
     return super(BigqueryModel, self).request(
         headers, path_params, query_params, body_value)
-  # pylint:enable-msg=C6409
+  # pylint: enable=g-bad-name
 
 
 class BigqueryHttp(http_request.HttpRequest):
@@ -274,13 +305,13 @@ class BigqueryHttp(http_request.HttpRequest):
       return BigqueryHttp(captured_model, *args, **kwds)
     return _Construct
 
-  def execute(self, **kwds):  # pylint:disable-msg=C6409
+  def execute(self, **kwds):  # pylint: disable=g-bad-name
     try:
       return super(BigqueryHttp, self).execute(**kwds)
     except apiclient.errors.HttpError, e:
       # TODO(user): Remove this when apiclient supports logging
       # of error responses.
-      self._model._log_response(e.resp, e.content)  # pylint:disable-msg=W0212
+      self._model._log_response(e.resp, e.content)  # pylint: disable=protected-access
       if e.resp.get('content-type', '').startswith('application/json'):
         BigqueryClient.RaiseError(json.loads(e.content))
       else:
@@ -704,28 +735,33 @@ class BigqueryClient(object):
 
   def ReadTableRows(self, table_dict, max_rows=sys.maxint):
     """Read at most max_rows rows from a table."""
-    page_token = None
-    rows = []
-    while len(rows) < max_rows:
-      data = self.apiclient.tabledata().list(
-          maxResults=max_rows - len(rows),
-          pageToken=page_token,
-          **table_dict).execute()
-      page_token = data.get('pageToken', None)
-      max_rows = min(max_rows, int(data['totalRows']))
-      more_rows = data.get('rows', [])
-      for row in more_rows:
-        rows.append([entry.get('v', '') for entry in row.get('f', [])])
-      if not page_token and len(rows) != max_rows:
-        raise BigqueryInterfaceError(
-            'PageToken missing for %r' % (
-                ApiClientHelper.TableReference.Create(**table_dict),))
-      if not more_rows and len(rows) != max_rows:
-        raise BigqueryInterfaceError(
-            'Not enough rows returned by server for %r' % (
-                ApiClientHelper.TableReference.Create(**table_dict),))
-    return rows
+    table_ref = ApiClientHelper.TableReference.Create(**table_dict)
+    return _TableTableReader(self.apiclient, table_ref).ReadRows(max_rows)
 
+  def ReadJobRows(self, job_dict, max_rows=sys.maxint):
+    """Read at most max_rows rows from a query result."""
+    job_ref = ApiClientHelper.JobReference.Create(**job_dict)
+    return _JobTableReader(self.apiclient, job_ref).ReadRows(max_rows)
+
+  def InsertTableRows(self, table_dict, inserts):
+    """Insert rows into a table.
+
+    Arguments:
+      table_dict: table reference into which rows are to be inserted.
+      inserts: array of InsertEntry tuples where insert_id can be None.
+
+    Returns:
+      result of the operation.
+    """
+    def _EncodeInsert(insert):
+      encoded = dict(json=insert.record)
+      if insert.insert_id:
+        encoded['insertId'] = insert.insert_id
+      return encoded
+    op = self.apiclient.tabledata().insertAll(
+        body=dict(rows=map(_EncodeInsert, inserts)),
+        **table_dict)
+    return op.execute()
 
   def ReadSchemaAndRows(self, table_dict, max_rows=sys.maxint):
     """Convenience method to get the schema and rows from a table.
@@ -738,8 +774,23 @@ class BigqueryClient(object):
       A tuple where the first item is the list of fields and the
       second item a list of rows.
     """
-    return (self.GetTableSchema(table_dict).get('fields', []),
-            self.ReadTableRows(table_dict, max_rows))
+    table_ref = ApiClientHelper.TableReference.Create(**table_dict)
+    return _TableTableReader(self.apiclient,
+                             table_ref).ReadSchemaAndRows(max_rows)
+
+  def ReadSchemaAndJobRows(self, job_dict, max_rows=sys.maxint):
+    """Convenience method to get the schema and rows from job query result.
+
+    Arguments:
+      job_dict: job reference dictionary.
+      max_rows: number of rows to read.
+
+    Returns:
+      A tuple where the first item is the list of fields and the
+      second item a list of rows.
+    """
+    job_ref = ApiClientHelper.JobReference.Create(**job_dict)
+    return _JobTableReader(self.apiclient, job_ref).ReadSchemaAndRows(max_rows)
 
   @staticmethod
   def ConfigureFormatter(formatter, reference_type, print_format='list'):
@@ -1072,7 +1123,7 @@ class BigqueryClient(object):
     return reference
 
   def ListJobRefs(self, **kwds):
-    return map(  # pylint:disable-msg=C6402
+    return map(  # pylint: disable=g-long-lambda
         BigqueryClient.ConstructObjectReference, self.ListJobs(**kwds))
 
   def ListJobs(self, reference=None,
@@ -1107,7 +1158,7 @@ class BigqueryClient(object):
 
   def ListProjectRefs(self, **kwds):
     """List the project references this user has access to."""
-    return map(  # pylint:disable-msg=C6402
+    return map(  # pylint: disable=g-long-lambda
         BigqueryClient.ConstructObjectReference, self.ListProjects(**kwds))
 
   def ListProjects(self, max_results=None, page_token=None):
@@ -1117,7 +1168,7 @@ class BigqueryClient(object):
     return result.get('projects', [])
 
   def ListDatasetRefs(self, **kwds):
-    return map(  # pylint:disable-msg=C6402
+    return map(  # pylint: disable=g-long-lambda
         BigqueryClient.ConstructObjectReference, self.ListDatasets(**kwds))
 
   def ListDatasets(self, reference=None, max_results=None, page_token=None):
@@ -1130,7 +1181,7 @@ class BigqueryClient(object):
     return result.get('datasets', [])
 
   def ListTableRefs(self, **kwds):
-    return map(  # pylint:disable-msg=C6402
+    return map(  # pylint: disable=g-long-lambda
         BigqueryClient.ConstructObjectReference, self.ListTables(**kwds))
 
   def ListTables(self, reference, max_results=None, page_token=None):
@@ -1431,6 +1482,93 @@ class BigqueryClient(object):
         projectId=project_id).execute()
     return result
 
+  def _StartQueryRpc(self,
+                     query,
+                     dry_run=None,
+                     use_cache=None,
+                     preserve_nulls=None,
+                     max_results=None,
+                     timeout_ms=None,
+                     min_completion_ratio=None,
+                     project_id=None,
+                     **kwds):
+    """Executes the given query using the rpc-style query api.
+
+    Args:
+      query: Query to execute.
+      dry_run: Optional. Indicates whether the query will only be validated and
+          return processing statistics instead of actually running.
+      use_cache: Optional. Whether to use the query cache.
+          Caching is best-effort only and you should not make
+          assumptions about whether or how long a query result will be cached.
+      preserve_nulls: Optional. Indicates whether to preserve nulls in input
+          data. Temporary flag; will be removed in a future version.
+      max_results: Maximum number of results to return.
+      timeout_ms: Timeout, in milliseconds, for the call to query().
+      min_completion_ratio: Optional. Specifies the the minimum fraction of
+          data that must be scanned before a query returns. This value should be
+          between 0.0 and 1.0 inclusive.
+      project_id: Project id to use.
+
+      **kwds: Extra keyword arguments passed directly to jobs.Query().
+
+    Returns:
+      The query response.
+
+    Raises:
+      BigqueryClientConfigurationError: if project_id and
+        self.project_id are None.
+    """
+    project_id = project_id or self.project_id
+    if not project_id:
+      raise BigqueryClientConfigurationError(
+          'Cannot run a query without a project id.')
+
+    request = {'query': query}
+    if self.dataset_id:
+      request['defaultDataset'] = dict(self.GetDatasetReference())
+
+    _ApplyParameters(
+        request,
+        preserve_nulls=preserve_nulls,
+        use_query_cache=use_cache,
+        timeout_ms=timeout_ms,
+        max_results=max_results,
+        min_completion_ratio=min_completion_ratio)
+    _ApplyParameters(request, dry_run=dry_run)
+    return self.apiclient.jobs().query(
+        body=request, projectId=project_id, **kwds).execute()
+
+  def GetQueryResults(self, job_id=None, project_id=None,
+                      max_results=None, timeout_ms=None):
+    """Waits for a query to complete, once.
+
+    Args:
+      job_id: The job id of the query job that we are waiting to complete.
+      project_id: The project id of the query job.
+      max_results: The maximum number of results.
+      timeout_ms: The number of milliseconds to wait for the query to complete.
+
+    Returns:
+      The getQueryResults() result.
+
+    Raises:
+      BigqueryClientConfigurationError: if project_id and
+        self.project_id are None.
+    """
+    project_id = project_id or self.project_id
+    if not project_id:
+      raise BigqueryClientConfigurationError(
+          'Cannot get query results without a project id.')
+
+    kwds = {}
+    _ApplyParameters(kwds,
+                     job_id=job_id,
+                     project_id=project_id,
+                     timeout_ms=timeout_ms,
+                     max_results=max_results)
+    return self.apiclient.jobs().getQueryResults(**kwds).execute()
+
   def RunJobSynchronously(self, configuration, project_id=None,
                           upload_file=None, job_id=None):
     result = self.StartJob(configuration, project_id=project_id,
@@ -1602,7 +1740,7 @@ class BigqueryClient(object):
     """Run a query job synchronously, and return the result.
 
     Args:
-      **kwds: Passed on to self.Query and self.ExecuteJob.
+      **kwds: Passed on to self.Query.
 
     Returns:
       The rows in the query result as a list.
@@ -1610,7 +1748,109 @@ class BigqueryClient(object):
     new_kwds = dict(kwds)
     new_kwds['sync'] = True
     job = self.Query(**new_kwds)
-    return self.ReadTableRows(job['configuration']['query']['destinationTable'])
+
+    return self.ReadJobRows(job['jobReference'])
+
+  def RunQueryRpc(self,
+                  query,
+                  dry_run=None,
+                  use_cache=None,
+                  preserve_nulls=None,
+                  max_results=None,
+                  wait=sys.maxint,
+                  min_completion_ratio=None,
+                  wait_printer_factory=None,
+                  max_single_wait=None,
+                  **kwds):
+    """Executes the given query using the rpc-style query api.
+
+    Args:
+      query: Query to execute.
+      dry_run: Optional. Indicates whether the query will only be validated and
+          return processing statistics instead of actually running.
+      use_cache: Optional. Whether to use the query cache.
+          Caching is best-effort only and you should not make
+          assumptions about whether or how long a query result will be cached.
+      preserve_nulls: Optional. Indicates whether to preserve nulls in input
+          data. Temporary flag; will be removed in a future version.
+      max_results: Optional. Maximum number of results to return.
+      wait: (optional, default maxint) Max wait time in seconds.
+      min_completion_ratio: Optional. Specifies the the minimum fraction of
+          data that must be scanned before a query returns. This value should be
+          between 0.0 and 1.0 inclusive.
+      wait_printer_factory: (optional, defaults to
+          self.wait_printer_factory) Returns a subclass of WaitPrinter
+          that will be called after each job poll.
+      max_single_wait: Optional. Maximum number of seconds to wait for each call
+          to query() / getQueryResults().
+
+      **kwds: Passed directly to self.ExecuteSyncQuery.
+
+    Raises:
+      BigqueryClientError: if no query is provided.
+      StopIteration: if the query does not complete within wait seconds.
+
+    Returns:
+      The a tuple containing the schema fields and list of results of the query.
+    """
+    if not self.sync:
+      raise BigqueryClientError('Running RPC-style query asynchronously is '
+                                'not supported')
+    if not query:
+      raise BigqueryClientError('No query string provided')
+
+    if wait_printer_factory:
+      printer = wait_printer_factory()
+    else:
+      printer = self.wait_printer_factory()
+
+    start_time = time.time()
+    elapsed_time = 0
+    job_reference = None
+    current_wait_ms = None
+    while True:
+      try:
+        elapsed_time = 0 if job_reference is None else time.time() - start_time
+        remaining_time = wait - elapsed_time
+        if max_single_wait is not None:
+          # Compute the current wait, being careful about overflow, since
+          # remaining_time may be counting down from sys.maxint.
+          current_wait_ms = int(min(remaining_time, max_single_wait) * 1000)
+          if current_wait_ms < 0:
+            current_wait_ms = sys.maxint
+        if remaining_time < 0:
+          raise StopIteration('Wait timed out. Query not finished.')
+        if job_reference is None:
+          # We haven't yet run a successful Query(), so we don't
+          # have a job id to check on.
+          result = self._StartQueryRpc(
+              query=query,
+              preserve_nulls=preserve_nulls,
+              use_cache=use_cache,
+              dry_run=dry_run,
+              min_completion_ratio=min_completion_ratio,
+              timeout_ms=current_wait_ms,
+              max_results=0,
+              **kwds)
+          job_reference = ApiClientHelper.JobReference.Create(
+              **result['jobReference'])
+        else:
+          # The query/getQueryResults methods do not return the job state,
+          # so we just print 'RUNNING' while we are actively waiting.
+          printer.Print(job_reference.jobId, elapsed_time, 'RUNNING')
+          result = self.GetQueryResults(
+              job_reference.jobId,
+              max_results=0,
+              timeout_ms=current_wait_ms)
+        if result['jobComplete']:
+          return self.ReadSchemaAndJobRows(dict(job_reference),
+                                           max_rows=max_results)
+      except BigqueryCommunicationError, e:
+        # Communication errors while waiting on a job are okay.
+        logging.warning('Transient error during query: %s', e)
+      except BigqueryBackendError, e:
+        # Temporary server errors while waiting on a job are okay.
+        logging.warning('Transient error during query: %s', e)
 
   def Query(self, query,
             destination_table=None,
@@ -1621,8 +1861,9 @@ class BigqueryClient(object):
             allow_large_results=None,
             dry_run=None,
             use_cache=None,
+            min_completion_ratio=None,
             **kwds):
-    # pylint:disable-msg=g-doc-args
+    # pylint: disable=g-doc-args
     """Execute the given query, returning the created job.
 
     The job will execute synchronously if sync=True is provided as an
@@ -1647,6 +1888,9 @@ class BigqueryClient(object):
           is CREATE_NEVER, will only run the query if the result is already
           cached. Caching is best-effort only and you should not make
           assumptions about whether or how long a query result will be cached.
+      min_completion_ratio: Optional. Specifies the the minimum fraction of
+          data that must be scanned before a query returns. This value should be
+          between 0.0 and 1.0 inclusive.
       **kwds: Passed on to self.ExecuteJob.
 
     Raises:
@@ -1674,7 +1918,8 @@ class BigqueryClient(object):
         preserve_nulls=preserve_nulls,
         priority=priority,
         write_disposition=write_disposition,
-        use_query_cache=use_cache)
+        use_query_cache=use_cache,
+        min_completion_ratio=min_completion_ratio)
     request = {'query': query_config}
     _ApplyParameters(request, dry_run=dry_run)
     return self.ExecuteJob(request, **kwds)
@@ -1773,6 +2018,140 @@ class BigqueryClient(object):
         destination_format=destination_format,
         print_header=print_header, field_delimiter=field_delimiter)
     return self.ExecuteJob(configuration={'extract': extract_config}, **kwds)
+
+
+class _TableReader(object):
+  """Base class that defines the TableReader interface.
+
+  _TableReaders provide a way to read paginated rows and schemas from a table.
+  """
+
+  def ReadRows(self, max_rows=None):
+    """Read ad most max_rows rows from a table.
+
+    Args:
+      max_rows: maximum number of rows to return.
+
+    Raises:
+      BigqueryInterfaceError: when bigquery returns something unexpected.
+
+    Returns:
+      list of rows, each of which is a list of field values.
+    """
+    (_, rows) = self.ReadSchemaAndRows(max_rows)
+    return rows
+
+  def ReadSchemaAndRows(self, max_rows=None):
+    """Read at most max_rows rows from a table and the schema.
+
+    Args:
+      max_rows: maximum number of rows to return.
+
+    Raises:
+      BigqueryInterfaceError: when bigquery returns something unexpected.
+
+    Returns:
+      A tuple where the first item is the list of fields and the
+      second item a list of rows.
+    """
+    page_token = None
+    rows = []
+    schema = {}
+    max_rows = max_rows or sys.maxint
+    while len(rows) < max_rows:
+      (more_rows, page_token, current_schema) = self._ReadOnePage(
+          max_rows=min(_MAX_ROWS_PER_REQUEST, max_rows - len(rows)),
+          page_token=page_token)
+      if not schema and current_schema:
+        schema = current_schema.get('fields', {})
+      for row in more_rows:
+        rows.append([entry.get('v', '') for entry in row.get('f', [])])
+      if not page_token:
+        break
+      else:
+        # API server returned a page token but no rows.
+        if not more_rows:
+          raise BigqueryInterfaceError(
+              'Not enough rows returned by server for %r' % (self,))
+    return (schema, rows)
+
+  def __str__(self):
+    return self._GetPrintContext()
+
+  def __repr__(self):
+    return self._GetPrintContext()
+
+  def _GetPrintContext(self):
+    """Returns context for what is being read."""
+    raise NotImplementedError('Subclass must implement GetPrintContext')
+
+  def _ReadOnePage(self, max_rows, page_token=None):
+    """Read one page of data, up to max_rows rows.
+
+    Assumes that the table is ready for reading. Will signal an error otherwise.
+
+    Args:
+      max_rows: maximum number of rows to return.
+      page_token: Optional. current page token.
+
+    Returns:
+      tuple of:
+      rows: the actual rows of the table, in f,v format.
+      page_token: the page token of the next page of results.
+      schema: the schema of the table.
+    """
+    raise NotImplementedError('Subclass must implement _ReadOnePage')
+
+
+class _TableTableReader(_TableReader):
+  """A TableReader that reads from a table."""
+
+  def __init__(self, local_apiclient, table_ref):
+    self.table_ref = table_ref
+    self._apiclient = local_apiclient
+
+  def _GetPrintContext(self):
+    return '%r' % (self.table_ref,)
+
+  def _ReadOnePage(self, max_rows, page_token=None):
+    table_dict = dict(self.table_ref)
+    data = self._apiclient.tabledata().list(
+        maxResults=max_rows,
+        pageToken=page_token,
+        **table_dict).execute()
+    page_token = data.get('pageToken', None)
+    rows = data.get('rows', [])
+
+    table_info = self._apiclient.tables().get(**table_dict).execute()
+    schema = table_info.get('schema', {})
+
+    data.get('schema', None)
+    return (rows, page_token, schema)
+
+
+class _JobTableReader(_TableReader):
+  """A TableReader that reads from a completed job."""
+
+  def __init__(self, local_apiclient, job_ref):
+    self.job_ref = job_ref
+    self._apiclient = local_apiclient
+
+  def _GetPrintContext(self):
+    return '%r' % (self.job_ref,)
+
+  def _ReadOnePage(self, max_rows, page_token=None):
+    data = self._apiclient.jobs().getQueryResults(
+        maxResults=max_rows,
+        pageToken=page_token,
+        # Sets the timeout to 0 because we assume the table is already ready.
+        timeoutMs=0,
+        **dict(self.job_ref)).execute()
+    if not data['jobComplete']:
+      raise BigqueryError('Job %s is not done' % (self,))
+    page_token = data.get('pageToken', None)
+    schema = data.get('schema', None)
+    rows = data.get('rows', [])
+    return (rows, page_token, schema)
 
 
 class ApiClientHelper(object):
