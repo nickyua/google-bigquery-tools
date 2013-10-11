@@ -6,7 +6,6 @@
 
 
 
-
 import cmd
 import codecs
 import datetime
@@ -147,6 +146,9 @@ flags.DEFINE_string(
     'service_account_credential_file', None,
     'File to be used as a credential store for service accounts. '
     'Must be set if using a service account.')
+flags.DEFINE_integer(
+    'max_rows_per_request', None,
+    'Specifies the max number of rows to return per read.')
 
 
 FLAGS = flags.FLAGS
@@ -1027,9 +1029,13 @@ class _Query(BigqueryCmd):
         'Name of destination table for query results.',
         flag_values=fv)
     flags.DEFINE_integer(
+        'start_row', 0,
+        'First row to return in the result.',
+        short_name='s', flag_values=fv)
+    flags.DEFINE_integer(
         'max_rows', 100,
         'How many rows to return in the result.',
-        flag_values=fv)
+        short_name='n', flag_values=fv)
     flags.DEFINE_boolean(
         'batch', False,
         'Whether to run the query in batch mode.',
@@ -1124,6 +1130,7 @@ class _Query(BigqueryCmd):
         self.PrintJobStartInfo(job)
       else:
         fields, rows = client.ReadSchemaAndJobRows(job['jobReference'],
+                                                   start_row=self.start_row,
                                                    max_rows=self.max_rows)
         Factory.ClientTablePrinter.GetTablePrinter().PrintTable(fields, rows)
 
@@ -1177,9 +1184,14 @@ class _List(BigqueryCmd):
   def __init__(self, name, fv):
     super(_List, self).__init__(name, fv)
     flags.DEFINE_boolean(
-        'all_jobs', None,
-        'Show results from all users in this project (for listing jobs only).',
+        'all', None,
+        'Show all results. For jobs, will show jobs from all users. For '
+        'datasets, will list hidden datasets.',
         short_name='a', flag_values=fv)
+    flags.DEFINE_boolean(
+        'all_jobs', None,
+        'DEPRECATED. Use --all instead',
+        flag_values=fv)
     flags.DEFINE_boolean(
         'jobs', False,
         'Show jobs described by this identifier.',
@@ -1210,6 +1222,7 @@ class _List(BigqueryCmd):
       bq ls -j proj
       bq ls -p -n 1000
       bq ls mydataset
+      bq ls -a
     """
     # pylint: disable=g-doc-exception
     if self.j and self.p:
@@ -1217,8 +1230,10 @@ class _List(BigqueryCmd):
           'Cannot specify more than one of -j and -p.')
     if self.p and identifier:
       raise app.UsageError('Cannot specify an identifier with -p')
-    if self.a and not self.j:
-      raise app.UsageError('-a can only be specified with -j')
+
+    # Copy deprecated flag specifying 'all' to current one.
+    if self.all_jobs is not None:
+      self.a = self.all_jobs
 
     client = Client.Get()
     formatter = _GetFormatterFromFlags()
@@ -1266,7 +1281,8 @@ class _List(BigqueryCmd):
       BigqueryClient.ConfigureFormatter(formatter, DatasetReference)
       results = map(  # pylint: disable=g-long-lambda
           client.FormatDatasetInfo,
-          client.ListDatasets(reference, max_results=self.max_results))
+          client.ListDatasets(reference, max_results=self.max_results,
+                              list_all=self.a))
     else:  # isinstance(reference, DatasetReference):
       BigqueryClient.ConfigureFormatter(formatter, TableReference)
       results = map(  # pylint: disable=g-long-lambda
@@ -1650,6 +1666,10 @@ class _Head(BigqueryCmd):
         'Reads rows from a table.',
         short_name='t', flag_values=fv)
     flags.DEFINE_integer(
+        'start_row', 0,
+        'The number of rows to skip before showing table data.',
+        short_name='s', flag_values=fv)
+    flags.DEFINE_integer(
         'max_rows', 100,
         'The number of rows to print when showing table data.',
         short_name='n', flag_values=fv)
@@ -1661,6 +1681,7 @@ class _Head(BigqueryCmd):
       bq head dataset.table
       bq head -j job
       bq head -n 10 dataset.table
+      bq head -s 5 -n 10 dataset.table
     """
     client = Client.Get()
     if self.j and self.t:
@@ -1673,9 +1694,12 @@ class _Head(BigqueryCmd):
 
     if isinstance(reference, JobReference):
       fields, rows = client.ReadSchemaAndJobRows(dict(reference),
+                                                 start_row=self.s,
                                                  max_rows=self.n)
     elif isinstance(reference, TableReference):
-      fields, rows = client.ReadSchemaAndRows(dict(reference), max_rows=self.n)
+      fields, rows = client.ReadSchemaAndRows(dict(reference),
+                                              start_row=self.s,
+                                              max_rows=self.n)
     else:
       raise app.UsageError("Invalid identifier '%s' for head." % (identifier,))
 
@@ -1687,11 +1711,6 @@ class _Insert(BigqueryCmd):
 
   def __init__(self, name, fv):
     super(_Insert, self).__init__(name, fv)
-    flags.DEFINE_integer(
-        'max_rows_per_request', None,
-        'Maximum number of rows to send in a single request. '
-        'If not set, sends all the rows in one request.',
-        flag_values=fv)
 
   def RunWithArgs(self, identifier='', filename=None):
     """Inserts rows in a table.

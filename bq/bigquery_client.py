@@ -437,6 +437,7 @@ class BigqueryClient(object):
         'sync': True,
         'wait_printer_factory': BigqueryClient.TransitionWaitPrinter,
         'job_id_generator': JobIdGeneratorIncrementing(JobIdGeneratorRandom()),
+        'max_rows_per_request': _MAX_ROWS_PER_REQUEST,
         }
     for flagname, default in default_flag_values.iteritems():
       if not hasattr(self, flagname):
@@ -733,12 +734,12 @@ class BigqueryClient(object):
     table_info = self.apiclient.tables().get(**table_dict).execute()
     return table_info.get('schema', {})
 
-  def ReadTableRows(self, table_dict, max_rows=sys.maxint):
+  def ReadTableRows(self, table_dict, max_rows=_MAX_ROWS_PER_REQUEST):
     """Read at most max_rows rows from a table."""
     table_ref = ApiClientHelper.TableReference.Create(**table_dict)
     return _TableTableReader(self.apiclient, table_ref).ReadRows(max_rows)
 
-  def ReadJobRows(self, job_dict, max_rows=sys.maxint):
+  def ReadJobRows(self, job_dict, max_rows=_MAX_ROWS_PER_REQUEST):
     """Read at most max_rows rows from a query result."""
     job_ref = ApiClientHelper.JobReference.Create(**job_dict)
     return _JobTableReader(self.apiclient, job_ref).ReadRows(max_rows)
@@ -763,11 +764,13 @@ class BigqueryClient(object):
         **table_dict)
     return op.execute()
 
-  def ReadSchemaAndRows(self, table_dict, max_rows=sys.maxint):
+  def ReadSchemaAndRows(self, table_dict, start_row=0,
+                        max_rows=_MAX_ROWS_PER_REQUEST):
     """Convenience method to get the schema and rows from a table.
 
     Arguments:
       table_dict: table reference dictionary.
+      start_row: first row to read.
       max_rows: number of rows to read.
 
     Returns:
@@ -775,14 +778,16 @@ class BigqueryClient(object):
       second item a list of rows.
     """
     table_ref = ApiClientHelper.TableReference.Create(**table_dict)
-    return _TableTableReader(self.apiclient,
-                             table_ref).ReadSchemaAndRows(max_rows)
+    return _TableTableReader(self.apiclient, self.max_rows_per_request,
+                             table_ref).ReadSchemaAndRows(start_row, max_rows)
 
-  def ReadSchemaAndJobRows(self, job_dict, max_rows=sys.maxint):
+  def ReadSchemaAndJobRows(self, job_dict, start_row=0,
+                           max_rows=_MAX_ROWS_PER_REQUEST):
     """Convenience method to get the schema and rows from job query result.
 
     Arguments:
       job_dict: job reference dictionary.
+      start_row: first row to read.
       max_rows: number of rows to read.
 
     Returns:
@@ -790,7 +795,9 @@ class BigqueryClient(object):
       second item a list of rows.
     """
     job_ref = ApiClientHelper.JobReference.Create(**job_dict)
-    return _JobTableReader(self.apiclient, job_ref).ReadSchemaAndRows(max_rows)
+    reader = _JobTableReader(self.apiclient, self.max_rows_per_request,
+                             job_ref)
+    return reader.ReadSchemaAndRows(start_row, max_rows)
 
   @staticmethod
   def ConfigureFormatter(formatter, reference_type, print_format='list'):
@@ -1171,12 +1178,15 @@ class BigqueryClient(object):
     return map(  # pylint: disable=g-long-lambda
         BigqueryClient.ConstructObjectReference, self.ListDatasets(**kwds))
 
-  def ListDatasets(self, reference=None, max_results=None, page_token=None):
+  def ListDatasets(self, reference=None, max_results=None, page_token=None,
+                   list_all=None):
     """List the datasets associated with this reference."""
     reference = self._NormalizeProjectReference(reference)
     _Typecheck(reference, ApiClientHelper.ProjectReference,
                method='ListDatasets')
     request = self._PrepareListRequest(reference, max_results, page_token)
+    if list_all is not None:
+      request['all'] = list_all
     result = self.apiclient.datasets().list(**request).execute()
     return result.get('datasets', [])
 
@@ -1560,7 +1570,6 @@ class BigqueryClient(object):
     if not project_id:
       raise BigqueryClientConfigurationError(
           'Cannot get query results without a project id.')
-
     kwds = {}
     _ApplyParameters(kwds,
                      job_id=job_id,
@@ -1637,7 +1646,7 @@ class BigqueryClient(object):
       self.print_on_done = True
       print '\rWaiting on %s ... (%ds) Current status: %-7s' % (
           job_id, wait_time, status),
-      sys.stdout.flush()
+      sys.stderr.flush()
 
   class TransitionWaitPrinter(VerboseWaitPrinter):
     """A WaitPrinter that only prints status change updates."""
@@ -2026,10 +2035,11 @@ class _TableReader(object):
   _TableReaders provide a way to read paginated rows and schemas from a table.
   """
 
-  def ReadRows(self, max_rows=None):
+  def ReadRows(self, start_row=0, max_rows=None):
     """Read ad most max_rows rows from a table.
 
     Args:
+      start_row: first row to return.
       max_rows: maximum number of rows to return.
 
     Raises:
@@ -2038,13 +2048,14 @@ class _TableReader(object):
     Returns:
       list of rows, each of which is a list of field values.
     """
-    (_, rows) = self.ReadSchemaAndRows(max_rows)
+    (_, rows) = self.ReadSchemaAndRows(start_row=start_row, max_rows=max_rows)
     return rows
 
-  def ReadSchemaAndRows(self, max_rows=None):
+  def ReadSchemaAndRows(self, start_row, max_rows=None):
     """Read at most max_rows rows from a table and the schema.
 
     Args:
+      start_row: first row to read.
       max_rows: maximum number of rows to return.
 
     Raises:
@@ -2057,17 +2068,22 @@ class _TableReader(object):
     page_token = None
     rows = []
     schema = {}
-    max_rows = max_rows or sys.maxint
+    max_rows = max_rows or _MAX_ROWS_PER_REQUEST
     while len(rows) < max_rows:
+      rows_to_read = max_rows - len(rows)
+      rows_to_read = min(self.max_rows_per_request, rows_to_read)
       (more_rows, page_token, current_schema) = self._ReadOnePage(
-          max_rows=min(_MAX_ROWS_PER_REQUEST, max_rows - len(rows)),
+          None if page_token else start_row,
+          max_rows=None if page_token else rows_to_read,
           page_token=page_token)
       if not schema and current_schema:
         schema = current_schema.get('fields', {})
       for row in more_rows:
         rows.append([entry.get('v', '') for entry in row.get('f', [])])
       if not page_token:
-        break
+        start_row += len(more_rows)
+        if not more_rows:
+          break
       else:
         # API server returned a page token but no rows.
         if not more_rows:
@@ -2085,12 +2101,13 @@ class _TableReader(object):
     """Returns context for what is being read."""
     raise NotImplementedError('Subclass must implement GetPrintContext')
 
-  def _ReadOnePage(self, max_rows, page_token=None):
+  def _ReadOnePage(self, start_row, max_rows, page_token=None):
     """Read one page of data, up to max_rows rows.
 
     Assumes that the table is ready for reading. Will signal an error otherwise.
 
     Args:
+      start_row: first row to read.
       max_rows: maximum number of rows to return.
       page_token: Optional. current page token.
 
@@ -2106,46 +2123,53 @@ class _TableReader(object):
 class _TableTableReader(_TableReader):
   """A TableReader that reads from a table."""
 
-  def __init__(self, local_apiclient, table_ref):
+  def __init__(self, local_apiclient, max_rows_per_request, table_ref):
     self.table_ref = table_ref
+    self.max_rows_per_request = max_rows_per_request
     self._apiclient = local_apiclient
 
   def _GetPrintContext(self):
     return '%r' % (self.table_ref,)
 
-  def _ReadOnePage(self, max_rows, page_token=None):
-    table_dict = dict(self.table_ref)
-    data = self._apiclient.tabledata().list(
-        maxResults=max_rows,
-        pageToken=page_token,
-        **table_dict).execute()
+  def _ReadOnePage(self, start_row, max_rows, page_token=None):
+    kwds = dict(self.table_ref)
+    kwds['maxResults'] = max_rows
+    if page_token:
+      kwds['pageToken'] = page_token
+    else:
+      kwds['startIndex'] = start_row
+    data = self._apiclient.tabledata().list(**kwds).execute()
     page_token = data.get('pageToken', None)
     rows = data.get('rows', [])
 
-    table_info = self._apiclient.tables().get(**table_dict).execute()
+    kwds = dict(self.table_ref)
+    table_info = self._apiclient.tables().get(**kwds).execute()
     schema = table_info.get('schema', {})
 
-    data.get('schema', None)
     return (rows, page_token, schema)
 
 
 class _JobTableReader(_TableReader):
   """A TableReader that reads from a completed job."""
 
-  def __init__(self, local_apiclient, job_ref):
+  def __init__(self, local_apiclient, max_rows_per_request, job_ref):
     self.job_ref = job_ref
+    self.max_rows_per_request = max_rows_per_request
     self._apiclient = local_apiclient
 
   def _GetPrintContext(self):
     return '%r' % (self.job_ref,)
 
-  def _ReadOnePage(self, max_rows, page_token=None):
-    data = self._apiclient.jobs().getQueryResults(
-        maxResults=max_rows,
-        pageToken=page_token,
-        # Sets the timeout to 0 because we assume the table is already ready.
-        timeoutMs=0,
-        **dict(self.job_ref)).execute()
+  def _ReadOnePage(self, start_row, max_rows, page_token=None):
+    kwds = dict(self.job_ref)
+    kwds['maxResults'] = max_rows
+    # Sets the timeout to 0 because we assume the table is already ready.
+    kwds['timeoutMs'] = 0
+    if page_token:
+      kwds['pageToken'] = page_token
+    else:
+      kwds['startIndex'] = start_row
+    data = self._apiclient.jobs().getQueryResults(**kwds).execute()
     if not data['jobComplete']:
       raise BigqueryError('Job %s is not done' % (self,))
     page_token = data.get('pageToken', None)
