@@ -27,8 +27,8 @@ from setuptools import setup  # pylint: disable=g-import-not-at-top
 REQUIRED_PACKAGES = [
     'google-apputils',
     'python-gflags',
-    'google-api-python-client<=1.2',
-    'oauth2client<=1.2',
+    'google-api-python-client==1.2',
+    'oauth2client==1.2',
     'httplib2',
     ]
 CONSOLE_SCRIPTS = [
@@ -42,7 +42,7 @@ py_version = platform.python_version()
 if py_version < '2.6.5' or py_version >= '3':
   raise ValueError('BigQuery requires Python >= 2.6.5.')
 
-_BQ_VERSION = '2.0.16'
+_BQ_VERSION = '2.0.17'
 
 setup(name='bigquery',
       version=_BQ_VERSION,

@@ -1,6 +1,6 @@
 {
  "kind": "discovery#restDescription",
- "etag": "\"mo5WHlwad31qA7V5eFQaSN14NNg/OHgf7N15_fw1GcPgHz6pO4okz-g\"",
+ "etag": "\"DGgqtFnjgu83tuwvvVNNUhOiHWk/JD9FB7iv8kKN81JcUTjacJleqmo\"",
  "discoveryVersion": "v1",
  "id": "bigquery:v2",
  "name": "bigquery",
@@ -1313,6 +1313,11 @@
      "httpMethod": "GET",
      "description": "Lists all the datasets in the specified project to which the caller has read access; however, a project owner can list (but not necessarily get) all datasets in his project.",
      "parameters": {
+      "all": {
+       "type": "boolean",
+       "description": "Whether to list all datasets, including hidden ones",
+       "location": "query"
+      },
       "maxResults": {
        "type": "integer",
        "description": "The maximum number of results to return",

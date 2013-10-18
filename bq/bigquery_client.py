@@ -460,7 +460,8 @@ class BigqueryClient(object):
     """Return the apiclient attached to self."""
     if self._apiclient is None:
       http = self.credentials.authorize(self.GetHttp())
-      bigquery_model = BigqueryModel(self.trace)
+      bigquery_model = BigqueryModel(
+          trace=self.trace)
       bigquery_http = BigqueryHttp.Factory(
           bigquery_model)
       discovery_document = self.discovery_document
@@ -737,12 +738,15 @@ class BigqueryClient(object):
   def ReadTableRows(self, table_dict, max_rows=_MAX_ROWS_PER_REQUEST):
     """Read at most max_rows rows from a table."""
     table_ref = ApiClientHelper.TableReference.Create(**table_dict)
-    return _TableTableReader(self.apiclient, table_ref).ReadRows(max_rows)
+    return _TableTableReader(
+        self.apiclient,
+        max_rows,
+        table_ref).ReadRows()
 
   def ReadJobRows(self, job_dict, max_rows=_MAX_ROWS_PER_REQUEST):
     """Read at most max_rows rows from a query result."""
     job_ref = ApiClientHelper.JobReference.Create(**job_dict)
-    return _JobTableReader(self.apiclient, job_ref).ReadRows(max_rows)
+    return _JobTableReader(self.apiclient, max_rows, job_ref).ReadRows()
 
   def InsertTableRows(self, table_dict, inserts):
     """Insert rows into a table.
@@ -2051,7 +2055,7 @@ class _TableReader(object):
     (_, rows) = self.ReadSchemaAndRows(start_row=start_row, max_rows=max_rows)
     return rows
 
-  def ReadSchemaAndRows(self, start_row, max_rows=None):
+  def ReadSchemaAndRows(self, start_row=0, max_rows=None):
     """Read at most max_rows rows from a table and the schema.
 
     Args:
