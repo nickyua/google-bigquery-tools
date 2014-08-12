@@ -28,8 +28,9 @@ Prerequisites
    $ sudo apt-get install maven2
    ```
 
-2. A valid Google account and a project configured at
-   https://code.google.com/apis/console/.
+2. A valid Google account, and a project configured at
+   [https://console.developers.google.com](https://console.developers.google.com), with
+   the BigQuery API enabled for that project as described [here](https://developers.google.com/bigquery/bigquery-api-quickstart).
 
 
 Installing and running
